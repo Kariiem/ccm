@@ -79,7 +79,6 @@ typedef enum {
     CCM_INFO,
     CCM_WARN,
     CCM_DEBUG,
-    CCM_TRACE,
     CCM_ERROR,
     CCM_LOG_LAST,
 } ccm_log_level;
@@ -109,7 +108,8 @@ struct ccm_target {
     ccm_target_array deps;
     i32 visited;
     i32 collected;
-    i32 j;
+    pid_t pid;
+    i32 status;
 };
 
 typedef struct {
@@ -117,6 +117,7 @@ typedef struct {
     ccm_string_array common_opts;
     ccm_target_array targets;
     ccm_string_da sb;
+    i32 j;
 } ccm_spec;
 
 c8* ccm_shift_args(i32 *argc, c8 ***argv);
@@ -127,7 +128,7 @@ void ccm_log(ccm_log_level l, c8 const *fmt, ...)
 time_t ccm_mtime(void);
 
 void ccm_sb_print(ccm_log_level l, ccm_string_da sb);
-void ccm_sb_exec(ccm_string_da sb);
+pid_t ccm_sb_exec(ccm_string_da sb);
 
 bool ccm_target_needs_rebuild(ccm_target *t);
 
@@ -147,7 +148,7 @@ void ccm_bootstrap(c8 const* compiler, i32 argc, c8 **argv);
 static i32 fork_count = 0;
 static i32 exec_count = 0;
 static i32 stat_count = 0;
-#define fork() (++fork_count, fork())
+#define fork() (++fork_count, vfork())
 #define exec(...) (++exec_count, exec(__VA_ARGS__))
 #define stat(path, buf) (++stat_count, stat(path, buf))
 #endif /* CCM_STATS */
@@ -163,9 +164,9 @@ c8* ccm_shift_args(i32 *argc, c8 ***argv)
 #ifdef CCM_STATS
 void ccm_stats()
 {
-    ccm_log(CCM_TRACE, "CCM_STATS: fork_count = %d\n", fork_count);
-    ccm_log(CCM_TRACE, "CCM_STATS: exec_count = %d\n", exec_count);
-    ccm_log(CCM_TRACE, "CCM_STATS: stat_count = %d\n", stat_count);
+    ccm_log(CCM_DEBUG, "CCM_STATS: fork_count = %d\n", fork_count);
+    ccm_log(CCM_DEBUG, "CCM_STATS: exec_count = %d\n", exec_count);
+    ccm_log(CCM_DEBUG, "CCM_STATS: stat_count = %d\n", stat_count);
 }
 #else
 #define ccm_stats()
@@ -179,7 +180,6 @@ void ccm_log(ccm_log_level l, c8 const *fmt, ...)
     case CCM_INFO:  level = "[INFO]";  break;
     case CCM_WARN:  level = "[WARN]";  break;
     case CCM_DEBUG: level = "[DEBUG]"; break;
-    case CCM_TRACE: level = "[TRACE]"; break;
     case CCM_ERROR: level = "[ERROR]"; break;
     default:        level = "[UNKNOWN]"; break;
     }
@@ -225,20 +225,27 @@ void ccm_sb_print(ccm_log_level l, ccm_string_da sb)
     free(buf);
 }
 
-void ccm_sb_exec(ccm_string_da sb)
+pid_t ccm_sb_exec(ccm_string_da sb)
 {
     ccm_sb_print(CCM_INFO, sb);
     c8 const *pathname = sb.items[0];
     c8 const** argv = &sb.items[0];
     pid_t pid = fork();
     switch(pid) {
+    case -1: {
+        ccm_log(CCM_ERROR, "vfork failed\n");
+        exit(1);
+    }
     case 0: {
-        execvp(pathname, (c8 *const*)argv);
-        ccm_log(CCM_ERROR, "execvp failed!\n");
-        exit(69);
+        if (execvp(pathname, (c8 *const*)argv) < 0) {
+            ccm_log(CCM_ERROR, "execvp failed!\n");
+            _exit(69);
+        }
+        ccm_unreachable("ccm_sb_exec");
         break;
     }
     default:
+        return pid;
         /* printf("Main process is building %s\n", b->sb.items[b->sb.length - 2]); */
     }
 }
@@ -260,12 +267,6 @@ bool ccm_target_needs_rebuild(ccm_target *t)
             output_mtime < srcfile_stat.st_mtime) {
             return true;
         }
-        /* TODO: is this really needed? */
-        /* else  { */
-        /*     ccm_log(CCM_ERROR, "Target: %s build failed, missing %s source file", */
-        /*             t->name, t->sources.items[i]); */
-        /*     return false; */
-        /* } */
     }
     return false;
 }
@@ -277,6 +278,7 @@ void ccm_spec_restore_common_opts(ccm_spec *b)
 
 void ccm_spec_prepare_common_prefix(ccm_spec *b)
 {
+    b->sb.length = 0;
     ccm_da_append(&b->sb, b->compiler);
     for (i32 i = 0; i < b->common_opts.length; ++i) {
         ccm_da_append(&b->sb, b->common_opts.items[i]);
@@ -291,18 +293,19 @@ void ccm_spec_build_target(ccm_spec *b, ccm_target *t)
     }
     t->visited = 1;
     if (t->collected) {
-        ccm_log(CCM_TRACE, "Target: %s is already built\n", t->name);
+        ccm_log(CCM_INFO, "Target: %s is already built\n", t->name);
         return;
     }
-    ccm_log(CCM_TRACE, "Target: %s is being built...\n", t->name ? t-> name :".phony");
     for (i32 i = 0; i < t->deps.length; ++i) {
         ccm_spec_build_target(b, t->deps.items[i]);
     }
-
     if (!ccm_target_needs_rebuild(t)) {
         ccm_log(CCM_INFO, "Target: %s is up to date\n", t->name);
         return;
     }
+
+    ccm_log(CCM_INFO, "Target: %s building in progress...\n",
+            t->name ? t-> name :".phony");
 
     for (i32 i = 0; i < t->pre_opts.length; ++i) {
         ccm_da_append(&b->sb, t->pre_opts.items[i]);
@@ -324,7 +327,7 @@ void ccm_spec_build_target(ccm_spec *b, ccm_target *t)
     }
 
     ccm_da_append(&b->sb, NULL);
-    ccm_sb_exec(b->sb); t->collected = 1;
+    t->pid = ccm_sb_exec(b->sb); t->collected = 1;
     ccm_spec_restore_common_opts(b);
 }
 
@@ -339,17 +342,28 @@ void ccm_spec_build(ccm_spec *b)
         * 2-Handle communication with child processes and status codes.
         */
         ccm_spec_build_target(b, b->targets.items[i]);
+
     }
     ccm_da_free(&b->sb);
-    i32 status;
-    while (wait(&status) != -1) ccm_log(CCM_DEBUG, "status = %d\n", status);
+
     ccm_stats();
+
+    for (i32 i = 0; i < b->targets.length; ++i) {
+        if (b->targets.items[i]->pid) {
+            waitpid(b->targets.items[i]->pid, &b->targets.items[i]->status, 0);
+            if (b->targets.items[i]->status) {
+                ccm_log(CCM_ERROR, "Target: %s failed to build, exit status = %d\n",
+                        b->targets.items[i]->name,
+                        b->targets.items[i]->status);
+            }
+        }
+    }
 }
 
 void ccm_spec_clean(ccm_spec *b)
 {
     for (i32 i = 0; i < b->targets.length; ++i) {
-        if (unlink(b->targets.items[i]->name) == -1) {
+        if (remove(b->targets.items[i]->name) == -1) {
             ccm_log(CCM_ERROR, "rm %s failed!\n", b->targets.items[i]->name);
             continue;
         }
@@ -369,45 +383,47 @@ void ccm_bootstrap(c8 const* compiler, i32 argc, c8 **argv)
     };
     ccm_target self = {
         .name = "./ccm",
-        .sources = ccm_string_array("./ccm.c"),
+        .sources = ccm_string_array("./ccm.c", "./ccm.h"),
     };
+
+    if (!ccm_target_needs_rebuild(&self)) {
+        ccm_log(CCM_INFO, "ccm up to date, skip bootstrapping\n");
+        return;
+    }
+
+    ccm_log(CCM_INFO, "ccm bootstrapping ...\n");
+
     struct stat outfile_stat;
-    time_t output_mtime = 0;
+    if (stat(self.name, &outfile_stat) != -1) rename("./ccm", "./ccm.old");
 
-    if (stat(self.name, &outfile_stat) != -1) {
-        output_mtime = outfile_stat.st_mtime;
-    } else {
-        ccm_unreachable("unreachable: build_bootstrap");
-    }
-    /* label */
-    if (ccm_mtime() < output_mtime) {
-        ccm_log(CCM_TRACE, "ccm up to date, skip bootstrapping\n");
-     return;
-    }
-    ccm_log(CCM_TRACE, "ccm bootstrapping ...\n");
-    rename("./ccm", "./ccm.old");
-    b.targets = ccm_target_array(&self);
-    /* label */
-    ccm_spec_build(&b);
+    ccm_spec_prepare_common_prefix(&b);
+    ccm_spec_build_target(&b, &self);
 
-    if (stat(self.name, &outfile_stat) != -1) {
-        unlink("./ccm.old");
+    waitpid(self.pid, &self.status, 0);
+
+    if (self.status == EXIT_SUCCESS) {
+        /* unlink("./ccm.old"); */
         execvp("./ccm", argv);
     } else {
-        ccm_log(CCM_ERROR, "ccm bootstrapping failed\n");
+        ccm_log(CCM_ERROR, "ccm bootstrapping failed, exit status = %d\n", self.status);
         rename("./ccm.old", "./ccm");
+        exit(1);
     }
 
 }
 #endif /* CCM_IMPLEMENTATION */
 
 /* TODOs
- * Correct bootstraping stat-syscall handling:
- *   in ccm_bootstrap, "./ccm" executable is checked twice at the label points
+ * Redirection:
+ *   Proper output redirection with pipes to ensure deterministic output order
  * Correct Handling of deps with respect to forking:
  *   forcing targets-with-deps to build in correct order.
  */
 
+/* That's ok, leave it for now
+ * Correct bootstrapping stat-syscall handling:
+ *   in ccm_bootstrap, "./ccm" executable is checked twice at the label points
+ */
 /* DONEs
  * Logging:
  *   improve logging with log levels.
