@@ -1,4 +1,3 @@
-#define CCM_STATS
 #define CCM_IMPLEMENTATION
 #include "ccm.h"
 
@@ -15,11 +14,12 @@ int main(s32 argc, c8 **argv)
 {
     ccm_spec b = {
         .compiler = "cc",
-        .common_opts =
-        ccm_string_array("-Wall", "-Wextra", "-g3", "-O2", "-fsanitize=address,bounds",
-                     "-I."),
+        .output_flag = "-o",
+        .common_opts = ccm_string_array("-Wall", "-Wextra", "-g3", "-O2",
+                                        "-fsanitize=undefined,address,bounds"),
         .argv = argv,
         .argc = argc,
+        .j = 3,
     };
 
     c8 *program = ccm_shift_args(&argc, &argv);
@@ -34,7 +34,7 @@ int main(s32 argc, c8 **argv)
     ccm_target triangle = {
         .name = "./bin/triangle",
         .sources = ccm_string_array("./examples/triangle.c"),
-        .post_opts = ccm_string_array("-lraylib", "-lm"),
+        .linker_opts = ccm_string_array("-lraylib", "-lm"),
     };
 
     ccm_target obj2c = {
@@ -45,15 +45,20 @@ int main(s32 argc, c8 **argv)
     ccm_target geometry = {
         .name = "./lib/geom",
         .sources = ccm_string_array("./lib/geometry.c"),
-        .pre_opts = ccm_string_array("-c"),
+        .compiler_opts = ccm_string_array("-c"),
     };
 
     ccm_target z_buffer = {
         .name = "./bin/z-buffer",
         .sources = ccm_string_array("./examples/z-buffer.c"),
-        .deps = ccm_deps_array(&geometry),
+        /* .deps = ccm_deps_array(&geometry), */
     };
-    b.deps= ccm_deps_array(&obj2c, &triangle, &z_buffer, &geometry);
+
+    /* triangle.deps = ccm_deps_array(&z_buffer, &geometry); */
+    /* obj2c.deps = ccm_deps_array(&z_buffer, &geometry); */
+
+    b.deps = ccm_deps_array(&obj2c, &triangle, &z_buffer, &geometry);
+
 
     if (bb) bb(&b);
 }
