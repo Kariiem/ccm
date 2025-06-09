@@ -171,9 +171,6 @@ typedef struct {
     ccm_rbvalue_t *items;
 } ccm_ring_buffer;
 
-ccm_ring_buffer ccm_rb_init(s32 cap);
-void            ccm_rb_deinit(ccm_ring_buffer *rb);
-
 void          ccm_rb_push(ccm_ring_buffer *rb, ccm_rbvalue_t v);
 ccm_rbvalue_t ccm_rb_pop(ccm_ring_buffer *rb);
 ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb);
@@ -458,15 +455,6 @@ void ccm_arena_deinit(ccm_arena *arena)
 // -----------------------------------------------------------------------------
 // Ring Buffer
 // -----------------------------------------------------------------------------
-ccm_ring_buffer ccm_rb_init(s32 cap)
-{
-    ccm_ring_buffer rb = {0};
-    rb.items = ccm_malloc(cap * sizeof(ccm_rbvalue_t));
-        /* ccm_arena_flexalloc(ccm_ring_buffer, items, a, CCM_RINGBUFFER_INITIAL_CAP); */
-    rb.cap = cap;
-    return rb;
-}
-
 void ccm_rb_push(ccm_ring_buffer *rb, ccm_rbvalue_t v)
 {
     if (rb->len == rb->cap) {
@@ -713,7 +701,7 @@ void ccm_bootstrap(ccm_spec *spec)
             ccm_panic("poll: polling bootstrap child proc failed with error %s\n",
                       strerror(errno));
         }
-        if (pfd.revents & (POLLIN | POLLHUP)) {
+        if (ret > 0 || (pfd.revents & (POLLIN | POLLHUP))) {
             lll n = 0;
             c8 *buf = cp.report.items;
             lll read_len = cp.report.cap;
@@ -731,6 +719,7 @@ void ccm_bootstrap(ccm_spec *spec)
                 cp.report.len += n;
                 if (cp.report.len == cp.report.cap) ccm_da_grow(&cp.report, cp.report.cap * 2);
             }
+            if (pfd.revents & POLLHUP) pfd.fd = -1;
         }
 
         if (ret == 0) continue;
