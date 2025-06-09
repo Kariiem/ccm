@@ -196,38 +196,39 @@ ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb);
 
 #define ccm_da_init(da, capacity)                                       \
     do {                                                                \
+        lll cap = (capacity);                                           \
         lll item_size = sizeof((da)->items[0]);                         \
-        lll nbytes = capacity * item_size;                              \
+        lll nbytes = cap * item_size;                                   \
         (da)->items = ccm_malloc(nbytes);                               \
-        (da)->cap   = capacity;                                         \
+        (da)->cap   = cap;                                              \
         (da)->len   = 0;                                                \
     } while(0)
 
-#define ccm_da_grow(da, newcap)                                         \
-    do {                                                                \
-        if ((da)->cap > newcap) break;   /* no shrink */                \
-        lll item_size = sizeof((da)->items[0]);                         \
-        void *p = ccm_realloc((da)->items, (newcap * item_size));       \
-        if (p == NULL) {                                                \
-            ccm_log(CCM_LOG_ERROR,                                      \
-                    "ccm_realloc failed at %s: %d",                     \
-                    __FILE_NAME__, __LINE__);                           \
-        }                                                               \
-        (da)->items = p;                                                \
-        (da)->cap   = newcap;                                           \
+#define ccm_da_grow(da, newcap)                                 \
+    do {                                                        \
+        lll cap = (newcap);                                     \
+        if ((da)->cap > cap) break;   /* no shrink */           \
+        lll item_size = sizeof((da)->items[0]);                 \
+        void *p = ccm_realloc((da)->items, (cap * item_size));  \
+        if (p == NULL) {                                        \
+            ccm_panic("ccm_realloc failed at %s: %d",           \
+                      __FILE_NAME__, __LINE__);                 \
+        }                                                       \
+        (da)->items = p;                                        \
+        (da)->cap   = cap;                                      \
     } while(0)
 
 
-#define ccm_da_append(da, item)                                         \
-    do {                                                                \
-        lll cap = (da)->cap;                                            \
-        lll len = (da)->len;                                            \
-        if (cap == len) {                                               \
-            cap = cap == 0 ? CCM_DA_INITIAL_CAP : cap * 2;              \
-            ccm_da_grow(da, cap);                                       \
-        }                                                               \
-        (da)->items[len] = item;                                        \
-        ++(da)->len;                                                    \
+#define ccm_da_append(da, item)                                 \
+    do {                                                        \
+        lll cap = (da)->cap;                                    \
+        lll len = (da)->len;                                    \
+        if (len == cap) {                                       \
+            cap = cap == 0 ? CCM_DA_INITIAL_CAP : cap * 2;      \
+            ccm_da_grow(da, cap);                               \
+        }                                                       \
+        (da)->items[len] = (item);                              \
+        ++(da)->len;                                            \
     } while(0)
 
 #define ccm_da_deinit(da)                       \
@@ -343,7 +344,7 @@ void ccm_spec_build_target(ccm_spec *spec, ccm_target const *t);
 void ccm_spec_build(ccm_spec *spec);
 void ccm_spec_clean(ccm_spec *spec);
 
-void ccm_bootstrap(ccm_spec *spec);
+void ccm_bootstrap(ccm_spec *spec, s32 timeout);
 
 c8   *ccm_shift_args(s32 *argc, c8 ***argv);
 
@@ -529,7 +530,7 @@ bool ccm_spawn_child_proc(ccm_child_proc *cp)
     }
     case 0: {
         close(cp->pipe.read);
-        dup2(cp->pipe.write, STDOUT_FILENO);
+        /* dup2(cp->pipe.write, STDOUT_FILENO); */
         dup2(cp->pipe.write, STDERR_FILENO);
         close(cp->pipe.write);
 
@@ -538,7 +539,7 @@ bool ccm_spawn_child_proc(ccm_child_proc *cp)
 
         if (execvp(pathname, (c8 *const*)argv) < 0) {
             ccm_log(CCM_LOG_ERROR, "execvp failed!\n");
-            _exit(1);
+            exit(1);
         }
         ccm_unreachable();
     }
@@ -669,11 +670,11 @@ c8 **ccm_compile_cmd(ccm_spec *spec, ccm_target const *t)
     return cmd;
 }
 
-void ccm_bootstrap(ccm_spec *spec)
+void ccm_bootstrap(ccm_spec *spec, s32 timeout)
 {
     ccm_target const bootstrap = {
         .name = "./ccm",
-        .sources = ccm_string_array("ccm.c"),
+        .sources = ccm_string_array("ccm.c", "ccm.h"),
     };
     if (!ccm_target_needs_rebuild(&bootstrap)) return;
 
@@ -682,7 +683,6 @@ void ccm_bootstrap(ccm_spec *spec)
         .cmd = ccm_compile_cmd(spec, &bootstrap),
     };
 
-    s32 timeout = 100;
     ccm_da_init(&cp.report, CCM_CHILD_PROC_INITIAL_BUFFER_CAP);
     memset(cp.report.items, 0, cp.report.cap);
 
@@ -701,25 +701,38 @@ void ccm_bootstrap(ccm_spec *spec)
             ccm_panic("poll: polling bootstrap child proc failed with error %s\n",
                       strerror(errno));
         }
+
         if (ret > 0 || (pfd.revents & (POLLIN | POLLHUP))) {
-            lll n = 0;
             c8 *buf = cp.report.items;
-            lll read_len = cp.report.cap;
-            while ((n = read(pfd.fd, buf, read_len))) {
+            lll read_len = cp.report.cap - cp.report.len;
+            lll n;
+            while (true) {
+                n = read(pfd.fd, buf, read_len);
                 if (n == -1 && errno == EINTR) continue;
-                if (n == -1 && errno == EAGAIN) break;
-                if (n == -1 && errno != EAGAIN) {
-                    ccm_log(CCM_LOG_ERROR,
-                            "read: reading bootstrap child proc output"
-                            "faild with error %s\n",
-                            strerror(errno));
+                if (n == -1 && errno == EAGAIN) {
+                    if (ret > 0) continue; // Retry if child exited
+                    if (pfd.revents & POLLHUP) continue; // Retry on POLLHUP
+                    break; // No data, wait for next poll
+                }
+                if (n == -1) {
+                    ccm_log(CCM_LOG_ERROR, "read: child %d failed: %s\n",
+                            cp.pid, strerror(errno));
                     break;
                 }
-                buf += n;
-                cp.report.len += n;
-                if (cp.report.len == cp.report.cap) ccm_da_grow(&cp.report, cp.report.cap * 2);
+                if (n == 0 && (ret > 0 || (pfd.revents & POLLHUP))) {
+                    break; // EOF confirmed
+                }
+                if (n > 0) {
+                    cp.report.len += n;
+                    buf += n;
+                    read_len -= n;
+                    if (read_len == 0) {
+                        ccm_da_grow(&cp.report, cp.report.cap * 2);
+                        buf = cp.report.items + cp.report.len;
+                        read_len = cp.report.cap - cp.report.len;
+                    }
+                }
             }
-            if (pfd.revents & POLLHUP) pfd.fd = -1;
         }
 
         if (ret == 0) continue;
@@ -729,7 +742,9 @@ void ccm_bootstrap(ccm_spec *spec)
                     strerror(errno));
             continue;
         }
-        assert(close(pfd.fd) == 0); /* NOTE */
+        if (close(pfd.fd) != 0) {
+            ccm_panic("bootstrap: close failed on fd %d: %s\n", pfd.fd, strerror(errno));
+        }
 
         if (WIFSIGNALED(cp.status)) {
             ccm_log(CCM_LOG_ERROR,
@@ -803,11 +818,17 @@ ccm_ring_buffer *ccm_compute_ready_queue(ccm_spec *spec)
 
 void ccm_spec_build(ccm_spec *spec)
 {
+    s32 timeout = 100;
+    s32 remaining_targets = spec->deps.len;
+    s32 n_running_jobs = 0;
+
+
     /* TODO remove duplicates from spec->deps array */
     if (spec->arena.memory == NULL) spec->arena = ccm_arena_init(CCM_ARENA_DEFAULT_CAP);
 
     /* bootstrap */ {
-        ccm_bootstrap(spec); /* this function will not return in case we need to rebuild */
+        /* this function will not return in case we need to rebuild */
+        ccm_bootstrap(spec, timeout);
         ccm_log(CCM_LOG_INFO, "ccm upto date, skip bootstrapping\n");
     }
 
@@ -818,16 +839,16 @@ void ccm_spec_build(ccm_spec *spec)
         ccm_spec_schedule(spec, &dfs);
     }
 
-    ccm_compute_dependents(spec);
     ccm_ring_buffer *ready_queue = ccm_compute_ready_queue(spec);
-    s32 remaining_targets = spec->deps.len;
-    s32 n_running_jobs = 0;
-    s32 timeout = 100;
 
+    /* compute reverse edges */
+    ccm_compute_dependents(spec);
+
+    /* allocate child procs and associated pollfd struct */
     pollfd         *pfds = ccm_arena_alloc(pollfd, &spec->arena, spec->j);
     ccm_child_proc *cps  = ccm_arena_alloc(ccm_child_proc, &spec->arena, spec->j);
     s32            *ws   = ccm_arena_alloc(s32, &spec->arena, spec->j);
-    ccm_ignore(ws);
+
 
     /* initialize report buffers */
     for (s32 i = 0; i < spec->j; ++i) {
@@ -863,26 +884,38 @@ void ccm_spec_build(ccm_spec *spec)
             ws[i] = waitpid(cps[i].pid, &cps[i].status, WNOHANG);
 
             if (ws[i] > 0 || (pfds[i].revents & (POLLIN | POLLHUP))) {
-                lll n = 0;
                 c8 *buf = cps[i].report.items;
-                lll read_len = cps[i].report.cap;
-                while ((n = read(pfds[i].fd, buf, read_len))) {
+                lll read_len = cps[i].report.cap - cps[i].report.len;
+                lll n;
+                while (true) {
+                    n = read(pfds[i].fd, buf, read_len);
                     if (n == -1 && errno == EINTR) continue;
-                    if (n == -1 && errno == EAGAIN) break;
-                    if (n == -1 && errno != EAGAIN) {
-                        ccm_log(CCM_LOG_ERROR,
-                                "read: reading bootstrap child proc output"
-                                "faild with error %s\n",
-                                strerror(errno));
+                    if (n == -1 && errno == EAGAIN) {
+                        if (ws[i] > 0) continue; // Retry if child exited
+                        if (pfds[i].revents & POLLHUP) continue; // Retry on POLLHUP
+                        break; // No data, wait for next poll
+                    }
+                    if (n == -1) {
+                        ccm_log(CCM_LOG_ERROR, "read: child %d failed: %s\n",
+                                cps[i].pid, strerror(errno));
                         break;
                     }
-                    buf += n;
-                    cps[i].report.len += n;
-                    if (cps[i].report.len == cps[i].report.cap) {
-                        ccm_da_grow(&cps[i].report, cps[i].report.cap * 2);
+                    if (n == 0 && (ws[i] > 0 || (pfds[i].revents & POLLHUP))) {
+                        break; // EOF confirmed
+                    }
+                    if (n > 0) {
+                        cps[i].report.len += n;
+                        buf += n;
+                        read_len -= n;
+                        if (read_len == 0) {
+                            ccm_da_grow(&cps[i].report, cps[i].report.cap * 2);
+                            buf = cps[i].report.items + cps[i].report.len;
+                            read_len = cps[i].report.cap - cps[i].report.len;
+                        }
                     }
                 }
             }
+
             if (pfds[i].revents & (POLLERR | POLLNVAL)) {
                 ccm_log(CCM_LOG_ERROR, "poll error on fd %d: revents = %x\n", pfds[i].fd, pfds[i].revents);
             }
@@ -913,6 +946,7 @@ void ccm_spec_build(ccm_spec *spec)
                         "============================================================\n");
                 /* reset report buffers for future use */
                 memset(cps[i].report.items, 0, cps[i].report.cap);
+                cps[i].report.len = 0;
             }
             /* update the ready queue with targets in current target depedent list */
             for (s32 d = 0; d < cps[i].target->revdeps.len; ++d) {
@@ -937,6 +971,7 @@ void ccm_spec_build(ccm_spec *spec)
 #ifdef CCM_STATS
     ccm_stats();
 #endif  /* CCM_STATS */
+
     for (s32 i = 0; i < spec->j; ++i) {
         ccm_da_deinit(&cps[i].report);
     }
