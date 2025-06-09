@@ -758,8 +758,52 @@ void ccm_bootstrap(ccm_spec *spec)
     exit(1);
 }
 
+void ccm_compute_dependents(ccm_spec *spec)
+{
+    for (s32 i = 0; i < spec->deps.len; ++i) {
+        ccm_target *t = spec->deps.items[i];
+        for (s32 j = 0; j < t->deps.len; ++j) {
+            ccm_target *dep = t->deps.items[j];
+            dep->revdeps.len += 1;
+        }
+    }
+
+    for (s32 i = 0; i < spec->deps.len; ++i) {
+        ccm_target *t = spec->deps.items[i];
+        t->revdeps.items = ccm_arena_alloc(ccm_target *, &spec->arena, t->revdeps.len);
+        t->revdeps.len = 0;
+    }
+
+    for (s32 i = 0; i < spec->deps.len; ++i) {
+        ccm_target *t = spec->deps.items[i];
+        for (s32 j = 0; j < t->deps.len; ++j) {
+            ccm_target *dep = t->deps.items[j];
+            dep->revdeps.items[dep->revdeps.len++] = t;
+        }
+    }
+}
+
+ccm_ring_buffer *ccm_compute_ready_queue(ccm_spec *spec)
+{
+    ccm_ring_buffer *ready_queue = ccm_arena_alloc(ccm_ring_buffer, &spec->arena);
+    ready_queue->items = ccm_arena_alloc(ccm_rbvalue_t, &spec->arena, spec->deps.len);
+    ready_queue->cap = spec->deps.len;
+    ready_queue->len = 0;
+    ready_queue->read = 0;
+    ready_queue->write = 0;
+
+    for (s32 i = 0; i < spec->deps.len; ++i) {
+        ccm_target *t = spec->deps.items[i];
+        if (t->deps.len == 0) {
+            ccm_rb_push(ready_queue, t);
+        }
+    }
+    return ready_queue;
+}
+
 void ccm_spec_build(ccm_spec *spec)
 {
+    /* TODO remove duplicates from spec->deps array */
     if (spec->arena.memory == NULL) spec->arena = ccm_arena_init(CCM_ARENA_DEFAULT_CAP);
 
     /* bootstrap */ {
@@ -773,46 +817,17 @@ void ccm_spec_build(ccm_spec *spec)
         dfs.items = ccm_arena_alloc(ccm_target*, &spec->arena, spec->deps.len);
         ccm_spec_schedule(spec, &dfs);
     }
-    /* TODO remove duplicates from spec->deps array */
-    /* construct the reverse edges */ {
-        for (s32 i = 0; i < spec->deps.len; ++i) {
-            ccm_target *t = spec->deps.items[i];
-            for (s32 j = 0; j < t->deps.len; ++j) {
-                ccm_target *dep = t->deps.items[j];
-                dep->revdeps.len += 1;
-            }
-        }
 
-        for (s32 i = 0; i < spec->deps.len; ++i) {
-            ccm_target *t = spec->deps.items[i];
-            t->revdeps.items = ccm_arena_alloc(ccm_target *, &spec->arena, t->revdeps.len);
-            t->revdeps.len = 0;
-        }
-
-        for (s32 i = 0; i < spec->deps.len; ++i) {
-            ccm_target *t = spec->deps.items[i];
-            for (s32 j = 0; j < t->deps.len; ++j) {
-                ccm_target *dep = t->deps.items[j];
-                dep->revdeps.items[dep->revdeps.len++] = t;
-            }
-        }
-    }
-
-    ccm_ring_buffer ready_queue = ccm_rb_init(CCM_RINGBUFFER_INITIAL_CAP);
-    for (s32 i = 0; i < spec->deps.len; ++i) {
-        ccm_target *t = spec->deps.items[i];
-        if (t->deps.len == 0) {
-            ccm_rb_push(&ready_queue, t);
-        }
-    }
-
-
+    ccm_compute_dependents(spec);
+    ccm_ring_buffer *ready_queue = ccm_compute_ready_queue(spec);
     s32 remaining_targets = spec->deps.len;
     s32 n_running_jobs = 0;
     s32 timeout = 100;
 
     pollfd         *pfds = ccm_arena_alloc(pollfd, &spec->arena, spec->j);
     ccm_child_proc *cps  = ccm_arena_alloc(ccm_child_proc, &spec->arena, spec->j);
+    s32            *ws   = ccm_arena_alloc(s32, &spec->arena, spec->j);
+    ccm_ignore(ws);
 
     /* initialize report buffers */
     for (s32 i = 0; i < spec->j; ++i) {
@@ -821,15 +836,17 @@ void ccm_spec_build(ccm_spec *spec)
     }
 
     ccm_log(CCM_LOG_NONE,
-            "========================================================================================================================\n");
+            "============================================================"
+            "============================================================\n");
     while (remaining_targets > 0) {
-        while (n_running_jobs < spec->j && 0 < ready_queue.len) {
-            ccm_target *t = ccm_rb_pop(&ready_queue);
+        while (n_running_jobs < spec->j && 0 < ready_queue->len) {
+            ccm_target *t = ccm_rb_pop(ready_queue);
+
             cps[n_running_jobs].target = t;
             cps[n_running_jobs].cmd = ccm_compile_cmd(spec, t);
             cps[n_running_jobs].id = n_running_jobs;
-            memset(cps[n_running_jobs].report.items, 0, cps[n_running_jobs].report.cap);
 
+            /* forks the child and sets up the pipe */
             ccm_spawn_child_proc(&cps[n_running_jobs]);
 
             pfds[n_running_jobs].fd     = cps[n_running_jobs].pipe.read;
@@ -842,10 +859,10 @@ void ccm_spec_build(ccm_spec *spec)
             ccm_panic("poll: target poll failed with error %s\n", strerror(errno));
         }
 
-        for (s32 i = 0; nready && i < n_running_jobs; ++i) {
-            if (pfds[i].revents == 0) continue;
-            --nready;
-            if (pfds[i].revents & (POLLIN | POLLHUP)) {
+        for (s32 i = 0; i < n_running_jobs; ++i) {
+            ws[i] = waitpid(cps[i].pid, &cps[i].status, WNOHANG);
+
+            if (ws[i] > 0 || (pfds[i].revents & (POLLIN | POLLHUP))) {
                 lll n = 0;
                 c8 *buf = cps[i].report.items;
                 lll read_len = cps[i].report.cap;
@@ -861,18 +878,17 @@ void ccm_spec_build(ccm_spec *spec)
                     }
                     buf += n;
                     cps[i].report.len += n;
-                    if (cps[i].report.len == cps[i].report.cap) ccm_da_grow(&cps[i].report, cps[i].report.cap * 2);
+                    if (cps[i].report.len == cps[i].report.cap) {
+                        ccm_da_grow(&cps[i].report, cps[i].report.cap * 2);
+                    }
                 }
             }
             if (pfds[i].revents & (POLLERR | POLLNVAL)) {
                 ccm_log(CCM_LOG_ERROR, "poll error on fd %d: revents = %x\n", pfds[i].fd, pfds[i].revents);
             }
-        }
 
-        for (s32 i = 0; i < n_running_jobs; ++i) {
-            s32 ret = waitpid(cps[i].pid, &cps[i].status, WNOHANG);
-            if (ret == 0) continue;
-            if (ret == -1) {
+            if (ws[i] == 0) continue;
+            if (ws[i] == -1) {
                 ccm_log(CCM_LOG_ERROR, "Target [%s]: waitpid failed on pid %d: %s\n",
                         cps[i].target->name,
                         cps[i].pid,
@@ -893,14 +909,17 @@ void ccm_spec_build(ccm_spec *spec)
                 ccm_cmd_print(spec->arena, cps[i].cmd);
                 write(STDOUT_FILENO, cps[i].report.items, cps[i].report.len);
                 ccm_log(CCM_LOG_NONE,
-                        "========================================================================================================================\n");
+                        "============================================================"
+                        "============================================================\n");
+                /* reset report buffers for future use */
+                memset(cps[i].report.items, 0, cps[i].report.cap);
             }
             /* update the ready queue with targets in current target depedent list */
             for (s32 d = 0; d < cps[i].target->revdeps.len; ++d) {
                 ccm_target *rt = cps[i].target->revdeps.items[d];
                 --rt->deps.len;
                 if (rt->deps.len == 0) {
-                    ccm_rb_push(&ready_queue, rt);
+                    ccm_rb_push(ready_queue, rt);
                 }
             }
 
@@ -915,14 +934,12 @@ void ccm_spec_build(ccm_spec *spec)
         }
     }
 
-
 #ifdef CCM_STATS
     ccm_stats();
 #endif  /* CCM_STATS */
     for (s32 i = 0; i < spec->j; ++i) {
         ccm_da_deinit(&cps[i].report);
     }
-    ccm_da_deinit(&ready_queue);
     ccm_arena_deinit(&spec->arena);
 }
 
