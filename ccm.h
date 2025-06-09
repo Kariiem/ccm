@@ -841,6 +841,7 @@ void ccm_spec_build(ccm_spec *spec)
         }
 
         for (s32 i = 0; nready && i < n_running_jobs; ++i) {
+            if (pfds[i].revents != 0) --nready;
             if (pfds[i].revents & POLLIN) {
                 c8 *buf = cps[i].report;
                 lll n = 0;
@@ -870,54 +871,57 @@ void ccm_spec_build(ccm_spec *spec)
                         break;
                     }
                 }
-
-                int ret = waitpid(cps[i].pid, &cps[i].status, WNOHANG);
-                if (ret == 0) {
-                    // Child not dead yet, skip this cycle
-                    continue;
-                }
-                if (ret == -1) {
-                    ccm_log(CCM_LOG_ERROR, "waitpid failed on pid %d: %s\n", cps[i].pid, strerror(errno));
-                    continue;
-                }
-
-                assert(close(pfds[i].fd) == 0);
-                if (WIFSIGNALED(cps[i].status)) {
-                    ccm_log(CCM_LOG_ERROR,
-                            "Target [%s] failed: child proc terminated with signal = %d\n",
-                            cps[i].target->name, WTERMSIG(cps[i].status));
-                }
-
-                if (WIFEXITED(cps[i].status)) {
-                    ccm_log(CCM_LOG_INFO, "job [%d] time: %f ms\n", cps[i].id,
-                            1000 * (double)(clock() - cps[i].time)/CLOCKS_PER_SEC);
-                    ccm_cmd_print(spec->arena, cps[i].cmd);
-                    ccm_log(CCM_LOG_NONE, "%s", cps[i].report);
-                    ccm_log(CCM_LOG_NONE,
-                            "========================================================================================================================\n");
-                }
-                /* update the ready queue with targets in current target depedent list */
-                for (s32 d = 0; d < cps[i].target->revdeps.len; ++d) {
-                    ccm_target *rt = cps[i].target->revdeps.items[d];
-                    --rt->deps.len;
-                    if (rt->deps.len == 0) {
-                        ccm_rb_push(&ready_queue, rt);
-                    }
-                }
-
-                /* simulate removing child proc and associated
-                 * pollfd by swapping the last one
-                 */
-                ccm_swap(ccm_child_proc, cps[i], cps[n_running_jobs - 1]);
-                ccm_swap(pollfd, pfds[i],pfds[n_running_jobs - 1]);
-                --i;
-
-                --n_running_jobs;
-                --nready;
-                --remaining_targets;
+            }
+            if (pfds[i].revents & (POLLERR | POLLNVAL)) {
+                ccm_log(CCM_LOG_ERROR, "poll error on fd %d: revents = %x\n", pfds[i].fd, pfds[i].revents);
             }
         }
+
+        for (s32 i = 0; i < n_running_jobs; ++i) {
+            int ret = waitpid(cps[i].pid, &cps[i].status, WNOHANG);
+            if (ret == 0) continue;
+            if (ret == -1) {
+                ccm_log(CCM_LOG_ERROR, "waitpid failed on pid %d: %s\n",
+                        cps[i].pid,
+                        strerror(errno));
+                continue;
+            }
+            assert(close(pfds[i].fd) == 0); /* NOTE */
+
+            if (WIFSIGNALED(cps[i].status)) {
+                ccm_log(CCM_LOG_ERROR,
+                        "Target [%s] failed: child proc terminated with signal = %d\n",
+                        cps[i].target->name,
+                        WTERMSIG(cps[i].status));
+            }
+            if (WIFEXITED(cps[i].status)) {
+                ccm_log(CCM_LOG_INFO, "job [%d] time: %f ms\n", cps[i].id,
+                        1000 * (double)(clock() - cps[i].time)/CLOCKS_PER_SEC);
+                ccm_cmd_print(spec->arena, cps[i].cmd);
+                ccm_log(CCM_LOG_NONE, "%s", cps[i].report);
+                ccm_log(CCM_LOG_NONE,
+                        "========================================================================================================================\n");
+            }
+            /* update the ready queue with targets in current target depedent list */
+            for (s32 d = 0; d < cps[i].target->revdeps.len; ++d) {
+                ccm_target *rt = cps[i].target->revdeps.items[d];
+                --rt->deps.len;
+                if (rt->deps.len == 0) {
+                    ccm_rb_push(&ready_queue, rt);
+                }
+            }
+
+            /* simulate removing child proc and associated
+             * pollfd by swapping the last one
+             */
+            ccm_swap(ccm_child_proc, cps[i], cps[n_running_jobs - 1]);
+            ccm_swap(pollfd, pfds[i],pfds[n_running_jobs - 1]);
+            --i;
+            --n_running_jobs;
+            --remaining_targets;
+        }
     }
+
 
 #ifdef CCM_STATS
     ccm_stats();
