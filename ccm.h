@@ -3,8 +3,11 @@
 
 #define _GNU_SOURCE
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <limits.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -16,9 +19,6 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <errno.h>
-#include <limits.h>
-#include <poll.h>
 
 // -----------------------------------------------------------------------------
 // [1] Aliases
@@ -287,6 +287,7 @@ typedef struct {
     ccm_pipe pipe;
     c8 **cmd;
     c8 *report;
+    clock_t time;
     ccm_target const *target;
 } ccm_child_proc;
 
@@ -541,6 +542,7 @@ bool ccm_spawn_child_proc(ccm_child_proc *cp)
     default: {
         close(cp->pipe.write);
         cp->pid = cpid;
+        cp->time = clock();
     }
     }
     return true;
@@ -868,8 +870,18 @@ void ccm_spec_build(ccm_spec *spec)
                         break;
                     }
                 }
+
+                int ret = waitpid(cps[i].pid, &cps[i].status, WNOHANG);
+                if (ret == 0) {
+                    // Child not dead yet, skip this cycle
+                    continue;
+                }
+                if (ret == -1) {
+                    ccm_log(CCM_LOG_ERROR, "waitpid failed on pid %d: %s\n", cps[i].pid, strerror(errno));
+                    continue;
+                }
+
                 assert(close(pfds[i].fd) == 0);
-                waitpid(cps[i].pid, &cps[i].status, 0);
                 if (WIFSIGNALED(cps[i].status)) {
                     ccm_log(CCM_LOG_ERROR,
                             "Target [%s] failed: child proc terminated with signal = %d\n",
@@ -877,7 +889,8 @@ void ccm_spec_build(ccm_spec *spec)
                 }
 
                 if (WIFEXITED(cps[i].status)) {
-                    ccm_log(CCM_LOG_INFO, "job [%d]\n", cps[i].id);
+                    ccm_log(CCM_LOG_INFO, "job [%d] time: %f ms\n", cps[i].id,
+                            1000 * (double)(clock() - cps[i].time)/CLOCKS_PER_SEC);
                     ccm_cmd_print(spec->arena, cps[i].cmd);
                     ccm_log(CCM_LOG_NONE, "%s", cps[i].report);
                     ccm_log(CCM_LOG_NONE,
@@ -934,6 +947,17 @@ c8* ccm_shift_args(s32 *argc, c8 ***argv)
 }
 
 #endif /* CCM_IMPLEMENTATION */
+
+/* TODOs
+ * proper poll handling:
+ *   refactor the poll handling code into reusable components
+ * examples:
+ *   write usage examples, implement unit tests for functions
+ * memory management:
+ *   improve memory management and decide on arenas vs malloc family
+ * logging:
+ *   improve job logging, namely CMD logging and other debug info, and add a verbosity flag for debugging
+ */
 
 /* DONEs
  * Redirection:
