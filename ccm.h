@@ -331,7 +331,7 @@ typedef struct {
 
 void  ccm_stats(void);
 
-bool ccm_spawn_child_proc(ccm_child_proc *cp);
+bool ccm_childproc_fork(ccm_child_proc *cp);
 
 void ccm_target_cmd(ccm_str_da sb, ccm_child_proc *cp);
 bool ccm_target_needs_rebuild(ccm_target const *t);
@@ -509,18 +509,73 @@ void ccm_stats(void)
 }
 #endif /* CCM_STATS */
 
-bool ccm_spawn_child_proc(ccm_child_proc *cp)
+void ccm_childproc_read(ccm_child_proc *cp, s32 revents)
+{
+    /* only called on fds where poll revents
+     * has POLLIN | POLLHUP
+     * or when child proc has exited
+     */
+    ccm_unused(revents);
+    c8 *buf = cp->report.items + cp->report.len;
+    lll read_len = cp->report.cap - cp->report.len;
+    lll n = 0;
+    for (s32 i = 0; (n = read(cp->pipe.read, buf, read_len)) ; ++i) {
+#ifdef CCM_DEBUG_READ_AFTER_POLL
+        ccm_log(CCM_LOG_DEBUG, "read iteration [%d], read %ld bytes\n", i, n);
+#endif
+        if (n == -1 && errno == EINTR) continue;
+        if (n == -1 && errno == EAGAIN) {
+#ifdef CCM_DEBUG_READ_AFTER_POLL
+            /* DONE investigate this matter more
+             * revents has POLLIN set, yet read fails with EAGAIN, so the pipe is
+             * empty, this is an interaction between poll and O_NONBLOCK, afaiu.
+             *
+             * Actually using pipe2(..., 0) never hits this path
+             * however I will keep using O_NONBLOCK and handle EAGAIN
+             * =====================================================================
+             *
+             * This turned out to be due to read being in a loop (to drain the pipe)
+             * making the pipe empty when there is no data to read, returning -1 and
+             * setting errno = EAGAIN
+             *
+             * The reason why this never happens when O_NONBLOCK is cleared, is because
+             * read blocks until there is data availabe, and since we do it in a loop,
+             * it actually block the whole poll ~~~> read pipeline, and actually waits
+             * for the writing end to close.
+             */
+            if (revents & POLLIN) {
+                ccm_log(CCM_LOG_DEBUG, "revents: POLLIN,   (%d)\n", i);
+            }
+            if (revents & POLLHUP) {
+                ccm_log(CCM_LOG_DEBUG, "revents: POLLHUP, (%d)\n", i);
+
+            }
+#endif
+            break;
+        }
+        if (n == -1) {
+            ccm_log(CCM_LOG_ERROR, "read: child %d failed: %s\n",
+                    cp->pid, strerror(errno));
+            break;
+        }
+        cp->report.len += n;
+        buf += n;
+        read_len -= n;
+        if (read_len == 0) {
+            ccm_da_grow(&cp->report, cp->report.cap * 2);
+            buf = cp->report.items + cp->report.len;
+            read_len = cp->report.cap - cp->report.len;
+        }
+    }
+}
+
+
+bool ccm_childproc_fork(ccm_child_proc *cp)
 {
     c8 *pathname = cp->cmd[0];
     c8 **argv    = cp->cmd;
+    pid_t cpid   = fork();
 
-    if (pipe2((int*)&cp->pipe, O_NONBLOCK) < 0) {
-        ccm_log(CCM_LOG_ERROR, "target [%s]: pipe2 failed, %s\n",
-                cp->target->name,
-                strerror(errno));
-        return false;
-    }
-    pid_t cpid = fork();
     switch (cpid) {
     case -1: {
         ccm_log(CCM_LOG_ERROR, "target [%s]: fork failed, %s\n",
@@ -530,12 +585,9 @@ bool ccm_spawn_child_proc(ccm_child_proc *cp)
     }
     case 0: {
         close(cp->pipe.read);
-        /* dup2(cp->pipe.write, STDOUT_FILENO); */
+        dup2(cp->pipe.write, STDOUT_FILENO);
         dup2(cp->pipe.write, STDERR_FILENO);
         close(cp->pipe.write);
-
-        setvbuf(stdout, NULL, _IONBF, 0);
-        setvbuf(stderr, NULL, _IONBF, 0);
 
         if (execvp(pathname, (c8 *const*)argv) < 0) {
             ccm_log(CCM_LOG_ERROR, "execvp failed!\n");
@@ -686,86 +738,72 @@ void ccm_bootstrap(ccm_spec *spec, s32 timeout)
     ccm_da_init(&cp.report, CCM_CHILD_PROC_INITIAL_BUFFER_CAP);
     memset(cp.report.items, 0, cp.report.cap);
 
+    if (pipe2((int*)&cp.pipe, 0) < 0) {
+        ccm_panic("bootstrap: pipe2 failed, %s\n",
+                  strerror(errno));
+    }
+
     rename(bootstrap.name, "ccm.old");
-    ccm_spawn_child_proc(&cp);
+
+    ccm_childproc_fork(&cp);
 
     pollfd pfd = {
         .fd = cp.pipe.read,
         .events = POLLIN
     };
 
-    while(1) /* equivalent to remaining > 0, with remaining = 1 initially */ {
-        s32 ret = waitpid(cp.pid, &cp.status, WNOHANG);
-
-        if (poll(&pfd, 1, timeout) == -1) {
+    for (s32 i = 0; 1; ++i) {
+#ifdef CCM_DEBUG_READ_AFTER_POLL
+        ccm_log(CCM_LOG_DEBUG, "bootstrap polling loop iteration %d\n", i);
+#endif
+        s32 ready = poll(&pfd, 1, timeout);
+        if (ready == -1) {
             ccm_panic("poll: polling bootstrap child proc failed with error %s\n",
                       strerror(errno));
         }
 
-        if (ret > 0 || (pfd.revents & (POLLIN | POLLHUP))) {
-            c8 *buf = cp.report.items;
-            lll read_len = cp.report.cap - cp.report.len;
-            lll n;
-            while (true) {
-                n = read(pfd.fd, buf, read_len);
-                if (n == -1 && errno == EINTR) continue;
-                if (n == -1 && errno == EAGAIN) {
-                    if (ret > 0) continue; // Retry if child exited
-                    if (pfd.revents & POLLHUP) continue; // Retry on POLLHUP
-                    break; // No data, wait for next poll
-                }
-                if (n == -1) {
-                    ccm_log(CCM_LOG_ERROR, "read: child %d failed: %s\n",
-                            cp.pid, strerror(errno));
-                    break;
-                }
-                if (n == 0 && (ret > 0 || (pfd.revents & POLLHUP))) {
-                    break; // EOF confirmed
-                }
-                if (n > 0) {
-                    cp.report.len += n;
-                    buf += n;
-                    read_len -= n;
-                    if (read_len == 0) {
-                        ccm_da_grow(&cp.report, cp.report.cap * 2);
-                        buf = cp.report.items + cp.report.len;
-                        read_len = cp.report.cap - cp.report.len;
-                    }
-                }
+        if (ready > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+            ccm_childproc_read(&cp, pfd.revents);
+            if (pfd.revents & POLLHUP) {
+                /* defensive precautions */
+                pfd.fd = -1;
+                break;
             }
         }
+    }
 
-        if (ret == 0) continue;
-        if (ret == -1) {
-            ccm_log(CCM_LOG_ERROR, "bootstrap: waitpid failed on pid %d: %s\n",
-                    cp.pid,
-                    strerror(errno));
-            continue;
-        }
-        if (close(pfd.fd) != 0) {
-            ccm_panic("bootstrap: close failed on fd %d: %s\n", pfd.fd, strerror(errno));
-        }
 
-        if (WIFSIGNALED(cp.status)) {
-            ccm_log(CCM_LOG_ERROR,
-                    "bootstrap failed: child proc terminated with signal = %d\n",
-                    WTERMSIG(cp.status));
+    s32 ret = waitpid(cp.pid, &cp.status, 0);
+
+    if (ret == -1) {
+        ccm_panic("bootstrap: waitpid failed on pid %d: %s\n",
+                  cp.pid,
+                  strerror(errno));
+    }
+    if (close(cp.pipe.read) != 0) {
+        ccm_panic("bootstrap: close failed on fd %d: %s\n",
+                  cp.pipe.read, strerror(errno));
+    }
+
+    if (WIFSIGNALED(cp.status)) {
+        ccm_log(CCM_LOG_ERROR,
+                "bootstrap failed: child proc terminated with signal = %d\n",
+                WTERMSIG(cp.status));
+        exit(1);
+    }
+
+    if (WIFEXITED(cp.status)) {
+        ccm_cmd_print(spec->arena, cp.cmd);
+        write(STDOUT_FILENO, cp.report.items, cp.report.len);
+
+        if (cp.status != 0) {
+            ccm_log(CCM_LOG_ERROR, "bootstrap failed, child proc exit status = %d\n",
+                    WEXITSTATUS(cp.status));
+            rename("ccm.old", bootstrap.name);
             exit(1);
         }
-
-        if (WIFEXITED(cp.status)) {
-            ccm_cmd_print(spec->arena, cp.cmd);
-            write(STDOUT_FILENO, cp.report.items, cp.report.len);
-
-            if (cp.status != 0) {
-                ccm_log(CCM_LOG_ERROR, "bootstrap failed, child proc exit status = %d\n",
-                        WEXITSTATUS(cp.status));
-                rename("ccm.old", bootstrap.name);
-                exit(1);
-            }
-        }
-        break;
     }
+
     ccm_da_deinit(&cp.report);
     ccm_log(CCM_LOG_INFO, "bootstrap succeeded\n");
     execvp(bootstrap.name, spec->argv);
@@ -831,7 +869,7 @@ void ccm_spec_build(ccm_spec *spec)
         ccm_bootstrap(spec, timeout);
         ccm_log(CCM_LOG_INFO, "ccm upto date, skip bootstrapping\n");
     }
-
+    exit(0);
     ccm_as_scratch_arena(spec->arena) {
         /* useful for cycle detection */
         ccm_target_array dfs = {0};
@@ -868,7 +906,7 @@ void ccm_spec_build(ccm_spec *spec)
             cps[n_running_jobs].id = n_running_jobs;
 
             /* forks the child and sets up the pipe */
-            ccm_spawn_child_proc(&cps[n_running_jobs]);
+            ccm_childproc_fork(&cps[n_running_jobs]);
 
             pfds[n_running_jobs].fd     = cps[n_running_jobs].pipe.read;
             pfds[n_running_jobs].events = POLLIN;
