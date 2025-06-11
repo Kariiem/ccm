@@ -494,9 +494,6 @@ void ccm_arena_deinit(ccm_arena *arena)
 // -----------------------------------------------------------------------------
 // Strings
 // -----------------------------------------------------------------------------
-/* TODO
- * ccm_concat: takes a list of strings and concats them into a single string seperated by spaces.
- */
 c8 *ccm_fmt(ccm_arena *arena, char const *fmt, ...)
 {
     va_list ap;
@@ -550,49 +547,12 @@ c8 *ccm_concat(ccm_arena *arena, c8 **str8s)
     return buf;
 }
 
-c8 *ccm_concat_with_snprintf(ccm_arena *arena, c8 **str8s)
-{
-    s32 len = 0;
-    s32 count = 0;
-    c8 **str8s_copy = str8s;
-
-    for (; *str8s_copy; ++str8s_copy, ++count) len += strlen(*str8s_copy) + 1;
-
-    lll mark = arena->off;
-    c8 *buf = ccm_arena_alloc(c8, arena, len);
-    s32 remaining = len;
-    c8 *itr_buf = buf;
-
-    for (s32 i = 0; i < count - 1; ++i) {
-        s32 n = snprintf(itr_buf, remaining, "%s ", str8s[i]);
-        if (n < 0 || n >= remaining) {
-            ccm_log(CCM_ERROR_LOG, "CMD: possible buffer overflow\n");
-            arena->off = mark;
-            return NULL;
-        }
-        itr_buf += n;
-        remaining -= n;
-    }
-    s32 n = snprintf(itr_buf, remaining, "%s", str8s[count-1]);
-    if (n < 0 || n >= remaining) {
-        ccm_log(CCM_ERROR_LOG, "CMD: possible buffer overflow\n");
-        arena->off = mark;
-        return NULL;
-    }
-
-    return buf;
-}
-
-
 // -----------------------------------------------------------------------------
 // Ring Buffer
 // -----------------------------------------------------------------------------
 void ccm_rb_push(ccm_ring_buffer *rb, ccm_rbvalue_t v)
 {
-    if (rb->len == rb->cap) {
-        rb->cap = 2*rb->cap;
-        rb->items = ccm_realloc(rb->items, rb->cap * sizeof(ccm_rbvalue_t)); /* TODO */
-    }
+    ccm_assert(rb->len < rb->cap);
     ++rb->len;
     rb->items[rb->write] = v;
     rb->write = (rb->write + 1) % rb->cap;
@@ -600,9 +560,7 @@ void ccm_rb_push(ccm_ring_buffer *rb, ccm_rbvalue_t v)
 
 ccm_rbvalue_t ccm_rb_pop(ccm_ring_buffer *rb)
 {
-    if (rb->len == 0) {
-        return NULL;
-    }
+    ccm_assert(rb->len > 0);
     --rb->len;
     ccm_rbvalue_t item = rb->items[rb->read];
     rb->read = (rb->read + 1)%rb->cap;
@@ -611,11 +569,10 @@ ccm_rbvalue_t ccm_rb_pop(ccm_ring_buffer *rb)
 
 ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb)
 {
-    if (rb->len == 0) {
-        return NULL;
-    }
+    ccm_assert(rb->len > 0);
     return rb->items[rb->read];
 }
+
 // -----------------------------------------------------------------------------
 // [8] ChildProc
 // -----------------------------------------------------------------------------
