@@ -320,8 +320,7 @@ bool ccm_childproc_fork(ccm_childproc *cp);
 void ccm_childproc_read(ccm_childproc *cp, s32 revents);
 s32  ccm_childproc_wait(ccm_childproc *cp);
 
- /* TODO remove spec argument, this is related to how command is printed */
-void ccm_childproc_report(ccm_spec *spec, ccm_childproc *cp);
+void ccm_childproc_report(ccm_childproc *cp);
 
 // -----------------------------------------------------------------------------
 // [9] Build Specification & Build Targets
@@ -509,16 +508,15 @@ c8 *ccm_fmt(ccm_arena *arena, char const *fmt, ...)
 
     if (len < 0) return NULL;
 
-    lll mark = arena->offset;
+    lll mark = arena->off;
     void *p = ccm_arena_alloc(c8, arena, len + 1); /* NOTE +1 */
-    if (p == NULL) return NULL;
 
     va_start(ap, fmt);
     len = vsnprintf(p, len + 1, fmt, ap);
     va_end(ap);
 
     if (len < 0) {
-        a->offset = mark;
+        arena->off = mark;
         return NULL;
     }
     return p;
@@ -526,7 +524,63 @@ c8 *ccm_fmt(ccm_arena *arena, char const *fmt, ...)
 
 c8 *ccm_concat(ccm_arena *arena, c8 **str8s)
 {
+    if (!str8s || !*str8s) return "";
 
+    s32 len = 0;
+    s32 count = 0;
+    for (c8 **s = str8s; *s; ++s, ++count) {
+        len += strlen(*s);
+    }
+    len += count - 1;  // spaces between strings
+    len += 1;          // null terminator
+
+    c8 *buf = ccm_arena_alloc(c8, arena, len);
+    c8 *p = buf;
+
+    for (s32 i = 0; i < count; ++i) {
+        s32 slen = strlen(str8s[i]);
+        memcpy(p, str8s[i], slen);
+        p += slen;
+
+        if (i != count - 1) {
+            *p++ = ' ';
+        }
+    }
+    *p = '\0';
+    return buf;
+}
+
+c8 *ccm_concat_with_snprintf(ccm_arena *arena, c8 **str8s)
+{
+    s32 len = 0;
+    s32 count = 0;
+    c8 **str8s_copy = str8s;
+
+    for (; *str8s_copy; ++str8s_copy, ++count) len += strlen(*str8s_copy) + 1;
+
+    lll mark = arena->off;
+    c8 *buf = ccm_arena_alloc(c8, arena, len);
+    s32 remaining = len;
+    c8 *itr_buf = buf;
+
+    for (s32 i = 0; i < count - 1; ++i) {
+        s32 n = snprintf(itr_buf, remaining, "%s ", str8s[i]);
+        if (n < 0 || n >= remaining) {
+            ccm_log(CCM_ERROR_LOG, "CMD: possible buffer overflow\n");
+            arena->off = mark;
+            return NULL;
+        }
+        itr_buf += n;
+        remaining -= n;
+    }
+    s32 n = snprintf(itr_buf, remaining, "%s", str8s[count-1]);
+    if (n < 0 || n >= remaining) {
+        ccm_log(CCM_ERROR_LOG, "CMD: possible buffer overflow\n");
+        arena->off = mark;
+        return NULL;
+    }
+
+    return buf;
 }
 
 
@@ -699,11 +753,11 @@ s32 ccm_childproc_wait(ccm_childproc *cp)
     return CCM_WAIT_ERROR;
 }
 
-void ccm_childproc_report(ccm_spec *spec, ccm_childproc *cp)
+void ccm_childproc_report(ccm_childproc *cp)
 {
-    ccm_cmd_print(spec->arena, cp->cmd);
     write(STDOUT_FILENO, cp->report.items, cp->report.len);
     memset(cp->report.items, 0, cp->report.len);
+    cp->report.len = 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -848,7 +902,7 @@ c8 **ccm_compile_cmd(ccm_spec *spec, ccm_target const *t)
     return cmd;
 }
 
-bool ccm_childprocs_monitor(ccm_spec *spec, ccm_childproc *cp, pollfd *pfd, s32 timeout)
+bool ccm_childprocs_monitor(ccm_childproc *cp, pollfd *pfd, s32 timeout)
 {
     ccm_childproc_fork(cp);
 
@@ -875,8 +929,6 @@ bool ccm_childprocs_monitor(ccm_spec *spec, ccm_childproc *cp, pollfd *pfd, s32 
         ev = ccm_childproc_wait(cp);
     } while (ev == CCM_WAIT_PENDING);
 
-    ccm_childproc_report(spec, cp);
-
     return ev == CCM_WAIT_DONE;
 }
 
@@ -893,7 +945,13 @@ void ccm_bootstrap(ccm_spec *spec, s32 timeout)
         .cmd = ccm_compile_cmd(spec, &bootstrap),
     };
 
+    c8 *oldname = ccm_fmt(&spec->arena, "%s.old", bootstrap.name);
+
     ccm_da_init(&cp.report, CCM_CHILDPROC_REPORT_BUF_CAP, CCM_ZERO_MEM);
+
+    ccm_as_scratch_arena(spec->arena) {
+        ccm_log(CCM_INFO_LOG, "CMD: %s\n", ccm_concat(&spec->arena, cp.cmd));
+    }
 
     {
         if (pipe2((int*)&cp.pipe, 0) < 0) {
@@ -905,10 +963,13 @@ void ccm_bootstrap(ccm_spec *spec, s32 timeout)
             .events = POLLIN
         };
 
-        rename(bootstrap.name, "ccm.old.old");
+        rename(bootstrap.name, oldname);
+        s32 ok = ccm_childprocs_monitor(&cp, &pfd, timeout);
 
-        if (!ccm_childprocs_monitor(spec, &cp, &pfd, timeout)) {
-            rename("ccm.old.old", bootstrap.name);
+        ccm_childproc_report(&cp);
+
+        if (!ok) {
+            rename(oldname, bootstrap.name);
             exit(1);
         }
     }
