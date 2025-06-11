@@ -43,7 +43,26 @@ typedef size_t    uw;
 typedef ssize_t   sw;
 typedef ptrdiff_t lll;
 
-typedef struct pollfd pollfd;
+typedef struct ccm_arena         ccm_arena;
+
+typedef struct ccm_str8_buf      ccm_str8_buf;
+typedef struct ccm_str8_view     ccm_str8_view;
+typedef struct ccm_str8_array    ccm_str8_array;
+typedef struct ccm_str8_dynarray ccm_str8_dynarray;
+
+typedef struct ccm_target*       ccm_rbvalue_t;
+typedef struct ccm_ring_buffer   ccm_ring_buffer;
+
+typedef struct pollfd            pollfd;
+typedef struct ccm_pipe          ccm_pipe;
+typedef struct ccm_childproc     ccm_childproc;
+typedef struct ccm_childproc_manager ccm_childproc_manager;
+
+typedef struct ccm_target        ccm_target;
+typedef struct ccm_target_array  ccm_target_array;
+typedef struct ccm_spec          ccm_spec;
+
+
 // -----------------------------------------------------------------------------
 // [2] Config & Helper Macros
 // -----------------------------------------------------------------------------
@@ -105,17 +124,16 @@ typedef struct pollfd pollfd;
 // -----------------------------------------------------------------------------
 // [3] Logger
 // -----------------------------------------------------------------------------
-typedef enum {
-    CCM_LOG_INFO,
-    CCM_LOG_WARN,
-    CCM_LOG_DEBUG,
-    CCM_LOG_ERROR,
-    CCM_LOG_NONE,
-    CCM_LOG_LAST,
-} ccm_log_level;
+enum {
+    CCM_NONE_LOG,
+    CCM_INFO_LOG,
+    CCM_WARN_LOG,
+    CCM_DEBUG_LOG,
+    CCM_ERROR_LOG,
+};
 
-void ccm_panic(c8 const *fmt, ...)  CCM_ATTR_PRINTF(1, 2);
-void ccm_log(ccm_log_level l, c8 const *fmt, ...)  CCM_ATTR_PRINTF(2, 3);
+void ccm_panic(c8 const *fmt, ...) CCM_ATTR_PRINTF(1, 2);
+void ccm_log(s32 l, c8 const *fmt, ...) CCM_ATTR_PRINTF(2, 3);
 
 // -----------------------------------------------------------------------------
 // [4] Arena
@@ -124,11 +142,11 @@ void ccm_log(ccm_log_level l, c8 const *fmt, ...)  CCM_ATTR_PRINTF(2, 3);
 #define CCM_ARENA_DEFAULT_CAP (64 * 1024 * 1024) /* 64mb */
 #endif /* CCM_ARENA_DEFAULT_CAP */
 
-typedef struct {
+struct ccm_arena {
     u8 *memory;
-    lll capacity;
-    lll offset;
-} ccm_arena;
+    lll cap;
+    lll off;
+};
 
 ccm_arena ccm_arena_init(lll capacity);
 void *ccm_arena_allocarray(ccm_arena *arena, lll itemsize, lll itemcount, lll align);
@@ -159,17 +177,13 @@ void  ccm_arena_deinit(ccm_arena *arena);
 // -----------------------------------------------------------------------------
 // [5] Ring Buffer
 // -----------------------------------------------------------------------------
-#define CCM_RINGBUFFER_INITIAL_CAP 64
-
-typedef struct ccm_target ccm_target;
-typedef ccm_target* ccm_rbvalue_t;
-typedef struct {
+struct ccm_ring_buffer {
     s32 read;
     s32 write;
     s32 cap;
     s32 len;
     ccm_rbvalue_t *items;
-} ccm_ring_buffer;
+};
 
 void          ccm_rb_push(ccm_ring_buffer *rb, ccm_rbvalue_t v);
 ccm_rbvalue_t ccm_rb_pop(ccm_ring_buffer *rb);
@@ -178,6 +192,11 @@ ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb);
 // -----------------------------------------------------------------------------
 // [6] Dynamic Array
 // -----------------------------------------------------------------------------
+enum /* whether to memset with 0 or not */ {
+    CCM_ZERO_MEM,
+    CCM_NOZERO_MEM,
+};
+
 #define CCM_DA_INITIAL_CAP 16
 
 #define ccm_da_for(i, da)        for (i = 0, i < (da)->len; ++i)
@@ -194,14 +213,17 @@ ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb);
                     X__da_foreach_itrname,                              \
                     X__da_foreach_it, /* dummy */ )(__VA_ARGS__)
 
-#define ccm_da_init(da, capacity)                                       \
-    do {                                                                \
-        lll cap = (capacity);                                           \
-        lll item_size = sizeof((da)->items[0]);                         \
-        lll nbytes = cap * item_size;                                   \
-        (da)->items = ccm_malloc(nbytes);                               \
-        (da)->cap   = cap;                                              \
-        (da)->len   = 0;                                                \
+#define ccm_da_init(da, capacity, flag)         \
+    do {                                        \
+        lll cap = (capacity);                   \
+        lll item_size = sizeof((da)->items[0]); \
+        lll nbytes = cap * item_size;           \
+        (da)->items = ccm_malloc(nbytes);       \
+        (da)->cap   = cap;                      \
+        (da)->len   = 0;                        \
+        (da)->items = flag == CCM_ZERO_MEM ?    \
+            memset((da)->items, 0, nbytes) :    \
+            (da)->items;                        \
     } while(0)
 
 #define ccm_da_grow(da, newcap)                                 \
@@ -241,18 +263,74 @@ ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb);
     } while (0)
 
 // -----------------------------------------------------------------------------
-// [7] Core
+// [7] Strings
 // -----------------------------------------------------------------------------
-#ifndef CCM_CHILD_PROC_INITIAL_BUFFER_CAP
-#define CCM_CHILD_PROC_INITIAL_BUFFER_CAP (8*1024) /* 8kb */
-#endif /* CCM_CHILD_PROC_OUTPUT_BUFFER_CAP */
+struct ccm_str8_buf {
+    lll cap;
+    lll len;
+    c8 *items;
+};
+struct ccm_str8_view {
+    lll len;
+    c8 *items;
+};
+struct ccm_str8_array {
+    lll len;
+    c8 **items;
+};
+struct ccm_str8_dynarray {
+    lll cap;
+    lll len;
+    c8 const**items;
+};
 
+// -----------------------------------------------------------------------------
+// [8] ChildProc
+// -----------------------------------------------------------------------------
+#ifndef CCM_CHILDPROC_REPORT_BUF_CAP
+#define CCM_CHILDPROC_REPORT_BUF_CAP (8*1024) /* 8kb */
+#endif /* CCM_CHILDPROC_REPORT_BUF_CAP */
 
-#define ccm_string_array_len(...) ccm_countof(((c8 *[]){__VA_ARGS__}))
-#define ccm_string_array(...)                           \
-    (ccm_string_array) {                                \
-        .len = ccm_string_array_len(__VA_ARGS__),       \
-            .items = (c8 *[]){ __VA_ARGS__ },           \
+enum {
+    CCM_WAIT_ERROR = 1,
+    CCM_WAIT_DONE,
+    CCM_WAIT_PENDING,
+};
+struct ccm_pipe {
+    s32 read;
+    s32 write;
+};
+struct ccm_childproc {
+    pid_t pid;
+    s32 id;
+    s32 status;
+    ccm_pipe pipe;
+    c8 **cmd;
+    ccm_str8_buf report;
+    clock_t time;
+    ccm_target const *target;
+};
+struct ccm_childproc_manager {
+    ccm_childproc *cps;
+    pollfd        *pfds;
+    lll           len;
+};
+
+bool ccm_childproc_fork(ccm_childproc *cp);
+void ccm_childproc_read(ccm_childproc *cp, s32 revents);
+s32  ccm_childproc_wait(ccm_childproc *cp);
+
+ /* TODO remove spec argument, this is related to how command is printed */
+void ccm_childproc_report(ccm_spec *spec, ccm_childproc *cp);
+
+// -----------------------------------------------------------------------------
+// [9] Build Specification & Build Targets
+// -----------------------------------------------------------------------------
+#define ccm_str8_array_len(...) ccm_countof(((c8 *[]){__VA_ARGS__}))
+#define ccm_str8_array(...)                     \
+    (ccm_str8_array) {                          \
+        .len = ccm_str8_array_len(__VA_ARGS__), \
+            .items = (c8 *[]){ __VA_ARGS__ },   \
             }
 
 #define X__deps_array_len(...) ccm_countof(((ccm_target *[]){__VA_ARGS__}))
@@ -265,51 +343,15 @@ ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb);
 #define ccm_deps_array_len(...) X__deps_array_len(__VA_ARGS__)
 #define ccm_deps_array(...)     X__deps_array(__VA_ARGS__)
 
-typedef struct {
-    lll cap;
-    lll len;
-    c8 *items;
-} ccm_str_builder;
-
-typedef struct {
-    lll len;
-    c8 **items;
-} ccm_string_array;
-
-typedef struct {
-    lll cap;
-    lll len;
-    c8 const**items;
-} ccm_str_da;
-
-typedef struct {
+struct ccm_target_array {
     lll len;
     ccm_target **items;
-} ccm_target_array;
-
-typedef struct pollfd ccm_pollfd;
-
-typedef struct {
-    s32 read;
-    s32 write;
-} ccm_pipe;
-
-typedef struct {
-    pid_t pid;
-    s32 id;
-    s32 status;
-    ccm_pipe pipe;
-    c8 **cmd;
-    ccm_str_builder report;
-    clock_t time;
-    ccm_target const *target;
-} ccm_child_proc;
-
+};
 struct ccm_target {
     c8 *name;
-    ccm_string_array sources;
-    ccm_string_array compiler_opts;
-    ccm_string_array linker_opts;
+    ccm_str8_array sources;
+    ccm_str8_array compiler_opts;
+    ccm_str8_array linker_opts;
     ccm_target_array deps;
     ccm_target_array revdeps;
 
@@ -317,23 +359,19 @@ struct ccm_target {
     s32 visited;
     s32 collected;
 };
-
-typedef struct {
+struct ccm_spec {
     c8 *compiler;
     c8 *output_flag;
-    ccm_string_array common_opts;
+    ccm_str8_array common_opts;
     ccm_target_array deps;
     ccm_arena arena;
     c8 **argv;
     s32 argc;
     s32 j;
-} ccm_spec;
-
+};
 void  ccm_stats(void);
 
-bool ccm_childproc_fork(ccm_child_proc *cp);
-
-void ccm_target_cmd(ccm_str_da sb, ccm_child_proc *cp);
+void ccm_target_cmd(ccm_str8_dynarray sb, ccm_childproc *cp);
 bool ccm_target_needs_rebuild(ccm_target const *t);
 c8 **ccm_compile_cmd(ccm_spec *spec, ccm_target const *t);
 
@@ -347,6 +385,8 @@ void ccm_spec_clean(ccm_spec *spec);
 void ccm_bootstrap(ccm_spec *spec, s32 timeout);
 
 c8   *ccm_shift_args(s32 *argc, c8 ***argv);
+
+void  ccm_cmd_print(ccm_arena a, c8 **cmd);
 
 #endif /* CCM_H */
 
@@ -379,16 +419,16 @@ void ccm_panic(c8 const *fmt, ...)
     abort();
 }
 
-void ccm_log(ccm_log_level l, c8 const *fmt, ...)
+void ccm_log(s32 l, c8 const *fmt, ...)
 {
     c8 const *level = NULL;
     va_list ap;
     switch(l) {
-    case CCM_LOG_INFO:  level = "[INFO]";  break;
-    case CCM_LOG_WARN:  level = "[WARN]";  break;
-    case CCM_LOG_DEBUG: level = "[DEBUG]"; break;
-    case CCM_LOG_ERROR: level = "[ERROR]"; break;
-    case CCM_LOG_NONE:  level = NULL; break;
+    case CCM_INFO_LOG:  level = "[INFO]";  break;
+    case CCM_WARN_LOG:  level = "[WARN]";  break;
+    case CCM_DEBUG_LOG: level = "[DEBUG]"; break;
+    case CCM_ERROR_LOG: level = "[ERROR]"; break;
+    case CCM_NONE_LOG:  level = NULL; break;
     default: ccm_unreachable();
     }
 
@@ -408,8 +448,8 @@ ccm_arena ccm_arena_init(lll capacity)
     if (arena.memory == NULL) {
         ccm_panic("ERROR :: arena_init: backend malloc: out of memory\n");
     }
-    arena.capacity = capacity;
-    arena.offset = 0;
+    arena.cap = capacity;
+    arena.off = 0;
 
     return arena;
 }
@@ -422,36 +462,73 @@ void* ccm_arena_allocarray(ccm_arena *arena, lll itemsize, lll itemcount, lll al
         ccm_panic("ERROR :: arena_alloc: size overflow\n");
     }
 
-    lll padding = -((uintptr_t)(arena->memory + arena->offset)) & (align - 1);
-    if (nbytes + padding > arena->capacity - arena->offset) {
+    lll padding = -((uintptr_t)(arena->memory + arena->off)) & (align - 1);
+    if (nbytes + padding > arena->cap - arena->off) {
         ccm_panic("ERROR :: arena_alloc: out of memory\n");
     }
 
-    arena->offset += padding;
-    void *p = arena->memory + arena->offset;
-    arena->offset += nbytes;
+    arena->off += padding;
+    void *p = arena->memory + arena->off;
+    arena->off += nbytes;
 
     return p;
 }
 
 void ccm_arena_reset(ccm_arena *arena)
 {
-    arena->offset = 0;
+    arena->off = 0;
 }
 
 void ccm_arena_log_stats(ccm_arena *arena)
 {
-    ccm_log(CCM_LOG_INFO, "spec.arena total commited memory = %ld\n", arena->offset);
+    ccm_log(CCM_INFO_LOG, "spec.arena total commited memory = %ld\n", arena->off);
 }
 
 void ccm_arena_deinit(ccm_arena *arena)
 {
     ccm_arena_log_stats(arena);
     ccm_free(arena->memory);
-    arena->capacity = 0;
-    arena->offset = 0;
+    arena->cap = 0;
+    arena->off = 0;
     arena->memory = NULL;
 }
+// -----------------------------------------------------------------------------
+// Strings
+// -----------------------------------------------------------------------------
+/* TODO
+ * ccm_concat: takes a list of strings and concats them into a single string seperated by spaces.
+ */
+c8 *ccm_fmt(ccm_arena *arena, char const *fmt, ...)
+{
+    va_list ap;
+    lll len = 0;
+
+    va_start(ap, fmt);
+    len = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+
+    if (len < 0) return NULL;
+
+    lll mark = arena->offset;
+    void *p = ccm_arena_alloc(c8, arena, len + 1); /* NOTE +1 */
+    if (p == NULL) return NULL;
+
+    va_start(ap, fmt);
+    len = vsnprintf(p, len + 1, fmt, ap);
+    va_end(ap);
+
+    if (len < 0) {
+        a->offset = mark;
+        return NULL;
+    }
+    return p;
+}
+
+c8 *ccm_concat(ccm_arena *arena, c8 **str8s)
+{
+
+}
+
 
 // -----------------------------------------------------------------------------
 // Ring Buffer
@@ -485,6 +562,149 @@ ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb)
     }
     return rb->items[rb->read];
 }
+// -----------------------------------------------------------------------------
+// [8] ChildProc
+// -----------------------------------------------------------------------------
+bool ccm_childproc_fork(ccm_childproc *cp)
+{
+    c8 *pathname = cp->cmd[0];
+    c8 **argv    = cp->cmd;
+    pid_t cpid   = fork();
+
+    switch (cpid) {
+    case -1: {
+        ccm_log(CCM_ERROR_LOG, "target [%s]: fork failed, %s\n",
+                cp->target->name,
+                strerror(errno));
+        return false;
+    }
+    case 0: {
+        close(cp->pipe.read);
+        dup2(cp->pipe.write, STDOUT_FILENO);
+        dup2(cp->pipe.write, STDERR_FILENO);
+        close(cp->pipe.write);
+
+        if (execvp(pathname, (c8 *const*)argv) < 0) {
+            ccm_log(CCM_ERROR_LOG, "execvp failed!\n");
+            exit(1);
+        }
+        ccm_unreachable();
+    }
+    default: {
+        close(cp->pipe.write);
+        cp->pid = cpid;
+        cp->time = clock();
+    }
+    }
+    return true;
+}
+
+void ccm_childproc_read(ccm_childproc *cp, s32 revents)
+{
+    /* only called on fds where poll revents
+     * has POLLIN | POLLHUP
+     * or when child proc has exited
+     */
+    ccm_unused(revents);
+    c8 *buf = cp->report.items + cp->report.len;
+    lll read_len = cp->report.cap - cp->report.len;
+    lll n = 0;
+    for (s32 i = 0; (n = read(cp->pipe.read, buf, read_len)) ; ++i) {
+#ifdef CCM_DEBUG_READ_AFTER_POLL
+        ccm_log(CCM_DEBUG_LOG, "read iteration [%d], read %ld bytes\n", i, n);
+#endif
+        if (n == -1 && errno == EINTR) continue;
+        if (n == -1 && errno == EAGAIN) {
+#ifdef CCM_DEBUG_READ_AFTER_POLL
+            /* DONE investigate this matter more
+             * revents has POLLIN set, yet read fails with EAGAIN, so the pipe is
+             * empty, this is an interaction between poll and O_NONBLOCK, afaiu.
+             *
+             * Actually using pipe2(..., 0) never hits this path
+             * however I will keep using O_NONBLOCK and handle EAGAIN
+             * =====================================================================
+             *
+             * This turned out to be due to read being in a loop (to drain the pipe)
+             * making the pipe empty when there is no data to read, returning -1 and
+             * setting errno = EAGAIN
+             *
+             * The reason why this never happens when O_NONBLOCK is cleared, is because
+             * read blocks until there is data availabe, and since we do it in a loop,
+             * it actually block the whole poll ~~~> read pipeline, and actually waits
+             * for the writing end to close.
+             */
+            if (revents & POLLIN) {
+                ccm_log(CCM_DEBUG_LOG, "revents: POLLIN,   (%d)\n", i);
+            }
+            if (revents & POLLHUP) {
+                ccm_log(CCM_DEBUG_LOG, "revents: POLLHUP, (%d)\n", i);
+
+            }
+#endif
+            break;
+        }
+        if (n == -1) {
+            ccm_log(CCM_ERROR_LOG, "read: child %d failed: %s\n",
+                    cp->pid, strerror(errno));
+            break;
+        }
+        cp->report.len += n;
+        buf += n;
+        read_len -= n;
+        if (read_len == 0) {
+            ccm_da_grow(&cp->report, cp->report.cap * 2);
+            buf = cp->report.items + cp->report.len;
+            read_len = cp->report.cap - cp->report.len;
+        }
+    }
+}
+
+s32 ccm_childproc_wait(ccm_childproc *cp)
+{
+    s32 ret = waitpid(cp->pid, &cp->status, WNOHANG);
+    c8 *tname = cp->target->name;
+
+    if (ret == 0) return CCM_WAIT_PENDING;
+    if (ret == -1) {
+        if (errno == EINTR) return CCM_WAIT_PENDING;
+        if (errno == ECHILD) ccm_panic("Target[%s]: invalid child process\n", tname);
+
+        ccm_log(CCM_ERROR_LOG,"Target [%s]: waitpid failed on pid %d: %s\n",
+                tname,
+                cp->pid,
+                strerror(errno));
+        return CCM_WAIT_ERROR;
+    }
+
+    if (WIFEXITED(cp->status)) {
+        if (cp->status == EXIT_SUCCESS) {
+            return CCM_WAIT_DONE;
+        }
+        ccm_log(CCM_ERROR_LOG, "Target [%s]: child proc exit status = %d\n",
+                tname,
+                WEXITSTATUS(cp->status));
+    } else if (WIFSIGNALED(cp->status)) {
+        ccm_log(CCM_ERROR_LOG, "Target [%s]: child proc terminated with signal = %d\n",
+                tname,
+                WTERMSIG(cp->status));
+    }
+
+    if (close(cp->pipe.read) != 0) {
+        ccm_log(CCM_ERROR_LOG,"Target [%s]: close failed on fd %d: %s\n",
+                tname,
+                cp->pipe.read,
+                strerror(errno));
+    }
+
+    return CCM_WAIT_ERROR;
+}
+
+void ccm_childproc_report(ccm_spec *spec, ccm_childproc *cp)
+{
+    ccm_cmd_print(spec->arena, cp->cmd);
+    write(STDOUT_FILENO, cp->report.items, cp->report.len);
+    memset(cp->report.items, 0, cp->report.len);
+}
 
 // -----------------------------------------------------------------------------
 // Core
@@ -509,100 +729,6 @@ void ccm_stats(void)
 }
 #endif /* CCM_STATS */
 
-void ccm_childproc_read(ccm_child_proc *cp, s32 revents)
-{
-    /* only called on fds where poll revents
-     * has POLLIN | POLLHUP
-     * or when child proc has exited
-     */
-    ccm_unused(revents);
-    c8 *buf = cp->report.items + cp->report.len;
-    lll read_len = cp->report.cap - cp->report.len;
-    lll n = 0;
-    for (s32 i = 0; (n = read(cp->pipe.read, buf, read_len)) ; ++i) {
-#ifdef CCM_DEBUG_READ_AFTER_POLL
-        ccm_log(CCM_LOG_DEBUG, "read iteration [%d], read %ld bytes\n", i, n);
-#endif
-        if (n == -1 && errno == EINTR) continue;
-        if (n == -1 && errno == EAGAIN) {
-#ifdef CCM_DEBUG_READ_AFTER_POLL
-            /* DONE investigate this matter more
-             * revents has POLLIN set, yet read fails with EAGAIN, so the pipe is
-             * empty, this is an interaction between poll and O_NONBLOCK, afaiu.
-             *
-             * Actually using pipe2(..., 0) never hits this path
-             * however I will keep using O_NONBLOCK and handle EAGAIN
-             * =====================================================================
-             *
-             * This turned out to be due to read being in a loop (to drain the pipe)
-             * making the pipe empty when there is no data to read, returning -1 and
-             * setting errno = EAGAIN
-             *
-             * The reason why this never happens when O_NONBLOCK is cleared, is because
-             * read blocks until there is data availabe, and since we do it in a loop,
-             * it actually block the whole poll ~~~> read pipeline, and actually waits
-             * for the writing end to close.
-             */
-            if (revents & POLLIN) {
-                ccm_log(CCM_LOG_DEBUG, "revents: POLLIN,   (%d)\n", i);
-            }
-            if (revents & POLLHUP) {
-                ccm_log(CCM_LOG_DEBUG, "revents: POLLHUP, (%d)\n", i);
-
-            }
-#endif
-            break;
-        }
-        if (n == -1) {
-            ccm_log(CCM_LOG_ERROR, "read: child %d failed: %s\n",
-                    cp->pid, strerror(errno));
-            break;
-        }
-        cp->report.len += n;
-        buf += n;
-        read_len -= n;
-        if (read_len == 0) {
-            ccm_da_grow(&cp->report, cp->report.cap * 2);
-            buf = cp->report.items + cp->report.len;
-            read_len = cp->report.cap - cp->report.len;
-        }
-    }
-}
-
-
-bool ccm_childproc_fork(ccm_child_proc *cp)
-{
-    c8 *pathname = cp->cmd[0];
-    c8 **argv    = cp->cmd;
-    pid_t cpid   = fork();
-
-    switch (cpid) {
-    case -1: {
-        ccm_log(CCM_LOG_ERROR, "target [%s]: fork failed, %s\n",
-                cp->target->name,
-                strerror(errno));
-        return false;
-    }
-    case 0: {
-        close(cp->pipe.read);
-        dup2(cp->pipe.write, STDOUT_FILENO);
-        dup2(cp->pipe.write, STDERR_FILENO);
-        close(cp->pipe.write);
-
-        if (execvp(pathname, (c8 *const*)argv) < 0) {
-            ccm_log(CCM_LOG_ERROR, "execvp failed!\n");
-            exit(1);
-        }
-        ccm_unreachable();
-    }
-    default: {
-        close(cp->pipe.write);
-        cp->pid = cpid;
-        cp->time = clock();
-    }
-    }
-    return true;
-}
 
 bool ccm_target_needs_rebuild(ccm_target const *t)
 {
@@ -650,12 +776,12 @@ void ccm_spec_schedule(ccm_spec *spec, ccm_target_array *ta)
     for (s32 i = 0; i < spec->deps.len; ++i) {
         ccm_spec_schedule_target(spec, spec->deps.items[i], ta);
     }
-    ccm_log(CCM_LOG_INFO, "job schedule: ");
+    ccm_log(CCM_INFO_LOG, "job schedule: ");
     for (s32 i = 0; i < ta->len - 1; ++i) {
-        ccm_log(CCM_LOG_NONE, "{%s: %d} ~~~> ",
+        ccm_log(CCM_NONE_LOG, "{%s: %d} ~~~> ",
                 ta->items[i]->name, ta->items[i]->level);
     }
-    ccm_log(CCM_LOG_NONE, "{%s: %d}\n",
+    ccm_log(CCM_NONE_LOG, "{%s: %d}\n",
             ta->items[ta->len - 1]->name,
             ta->items[ta->len - 1]->level);
 }
@@ -675,13 +801,13 @@ void ccm_cmd_print(ccm_arena scratch, c8 **cmd)
     for (; *cmd_copy; ++cmd_copy) {
         s32 n = snprintf(itr_buf, remaining, "%s ", *cmd_copy);
         if (n < 0 || n >= remaining) {
-            ccm_log(CCM_LOG_ERROR, "CMD: possible buffer overflow\n");
+            ccm_log(CCM_ERROR_LOG, "CMD: possible buffer overflow\n");
             return;
         }
         itr_buf += n;
         remaining -= n;
     }
-    ccm_log(CCM_LOG_INFO, "CMD: %s\n", buf);
+    ccm_log(CCM_INFO_LOG, "CMD: %s\n", buf);
 }
 
 c8 **ccm_compile_cmd(ccm_spec *spec, ccm_target const *t)
@@ -722,91 +848,76 @@ c8 **ccm_compile_cmd(ccm_spec *spec, ccm_target const *t)
     return cmd;
 }
 
-void ccm_bootstrap(ccm_spec *spec, s32 timeout)
+bool ccm_childprocs_monitor(ccm_spec *spec, ccm_childproc *cp, pollfd *pfd, s32 timeout)
 {
-    ccm_target const bootstrap = {
-        .name = "./ccm",
-        .sources = ccm_string_array("ccm.c", "ccm.h"),
-    };
-    if (!ccm_target_needs_rebuild(&bootstrap)) return;
+    ccm_childproc_fork(cp);
 
-    ccm_child_proc cp = {
-        .target = &bootstrap,
-        .cmd = ccm_compile_cmd(spec, &bootstrap),
-    };
-
-    ccm_da_init(&cp.report, CCM_CHILD_PROC_INITIAL_BUFFER_CAP);
-    memset(cp.report.items, 0, cp.report.cap);
-
-    if (pipe2((int*)&cp.pipe, 0) < 0) {
-        ccm_panic("bootstrap: pipe2 failed, %s\n",
-                  strerror(errno));
-    }
-
-    rename(bootstrap.name, "ccm.old");
-
-    ccm_childproc_fork(&cp);
-
-    pollfd pfd = {
-        .fd = cp.pipe.read,
-        .events = POLLIN
-    };
-
-    for (s32 i = 0; 1; ++i) {
+    for (s32 i = 0; ; ++i) {
 #ifdef CCM_DEBUG_READ_AFTER_POLL
-        ccm_log(CCM_LOG_DEBUG, "bootstrap polling loop iteration %d\n", i);
+        ccm_log(CCM_DEBUG_LOG, "bootstrap polling loop iteration %d\n", i);
 #endif
-        s32 ready = poll(&pfd, 1, timeout);
+        s32 ready = poll(pfd, 1, timeout);
         if (ready == -1) {
             ccm_panic("poll: polling bootstrap child proc failed with error %s\n",
                       strerror(errno));
         }
 
-        if (ready > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
-            ccm_childproc_read(&cp, pfd.revents);
-            if (pfd.revents & POLLHUP) {
-                /* defensive precautions */
-                pfd.fd = -1;
+        if (ready > 0 && (pfd->revents & (POLLIN | POLLHUP))) {
+            ccm_childproc_read(cp, pfd->revents);
+            if (pfd->revents & POLLHUP) {
                 break;
             }
         }
     }
 
+    s32 ev = 0;
+    do {
+        ev = ccm_childproc_wait(cp);
+    } while (ev == CCM_WAIT_PENDING);
 
-    s32 ret = waitpid(cp.pid, &cp.status, 0);
+    ccm_childproc_report(spec, cp);
 
-    if (ret == -1) {
-        ccm_panic("bootstrap: waitpid failed on pid %d: %s\n",
-                  cp.pid,
-                  strerror(errno));
-    }
-    if (close(cp.pipe.read) != 0) {
-        ccm_panic("bootstrap: close failed on fd %d: %s\n",
-                  cp.pipe.read, strerror(errno));
-    }
+    return ev == CCM_WAIT_DONE;
+}
 
-    if (WIFSIGNALED(cp.status)) {
-        ccm_log(CCM_LOG_ERROR,
-                "bootstrap failed: child proc terminated with signal = %d\n",
-                WTERMSIG(cp.status));
-        exit(1);
-    }
+void ccm_bootstrap(ccm_spec *spec, s32 timeout)
+{
+    ccm_target const bootstrap = {
+        .name = "./ccm",
+        .sources = ccm_str8_array("ccm.c", "ccm.h"),
+    };
+    if (!ccm_target_needs_rebuild(&bootstrap)) return;
 
-    if (WIFEXITED(cp.status)) {
-        ccm_cmd_print(spec->arena, cp.cmd);
-        write(STDOUT_FILENO, cp.report.items, cp.report.len);
+    ccm_childproc cp = {
+        .target = &bootstrap,
+        .cmd = ccm_compile_cmd(spec, &bootstrap),
+    };
 
-        if (cp.status != 0) {
-            ccm_log(CCM_LOG_ERROR, "bootstrap failed, child proc exit status = %d\n",
-                    WEXITSTATUS(cp.status));
-            rename("ccm.old", bootstrap.name);
+    ccm_da_init(&cp.report, CCM_CHILDPROC_REPORT_BUF_CAP, CCM_ZERO_MEM);
+
+    {
+        if (pipe2((int*)&cp.pipe, 0) < 0) {
+            ccm_panic("bootstrap: pipe2 failed, %s\n",
+                      strerror(errno));
+        }
+        pollfd pfd = {
+            .fd = cp.pipe.read,
+            .events = POLLIN
+        };
+
+        rename(bootstrap.name, "ccm.old.old");
+
+        if (!ccm_childprocs_monitor(spec, &cp, &pfd, timeout)) {
+            rename("ccm.old.old", bootstrap.name);
             exit(1);
         }
     }
 
     ccm_da_deinit(&cp.report);
-    ccm_log(CCM_LOG_INFO, "bootstrap succeeded\n");
+    ccm_log(CCM_INFO_LOG, "bootstrap succeeded\n");
+
     execvp(bootstrap.name, spec->argv);
+
     ccm_panic("bootstrap: execvp failed: %s\n", strerror(errno));
     exit(1);
 }
@@ -867,8 +978,10 @@ void ccm_spec_build(ccm_spec *spec)
     /* bootstrap */ {
         /* this function will not return in case we need to rebuild */
         ccm_bootstrap(spec, timeout);
-        ccm_log(CCM_LOG_INFO, "ccm upto date, skip bootstrapping\n");
+        ccm_log(CCM_INFO_LOG, "ccm upto date, skip bootstrapping\n");
     }
+
+
     exit(0);
     ccm_as_scratch_arena(spec->arena) {
         /* useful for cycle detection */
@@ -883,18 +996,17 @@ void ccm_spec_build(ccm_spec *spec)
     ccm_compute_dependents(spec);
 
     /* allocate child procs and associated pollfd struct */
-    pollfd         *pfds = ccm_arena_alloc(pollfd, &spec->arena, spec->j);
-    ccm_child_proc *cps  = ccm_arena_alloc(ccm_child_proc, &spec->arena, spec->j);
-    s32            *ws   = ccm_arena_alloc(s32, &spec->arena, spec->j);
+    pollfd        *pfds = ccm_arena_alloc(pollfd, &spec->arena, spec->j);
+    ccm_childproc *cps  = ccm_arena_alloc(ccm_childproc, &spec->arena, spec->j);
+    s32            *ws  = ccm_arena_alloc(s32, &spec->arena, spec->j);
 
 
     /* initialize report buffers */
     for (s32 i = 0; i < spec->j; ++i) {
-        ccm_da_init(&cps[i].report, CCM_CHILD_PROC_INITIAL_BUFFER_CAP);
-        memset(cps[i].report.items, 0, cps[i].report.cap);
+        ccm_da_init(&cps[i].report, CCM_CHILDPROC_REPORT_BUF_CAP, CCM_ZERO_MEM);
     }
 
-    ccm_log(CCM_LOG_NONE,
+    ccm_log(CCM_NONE_LOG,
             "============================================================"
             "============================================================\n");
     while (remaining_targets > 0) {
@@ -934,7 +1046,7 @@ void ccm_spec_build(ccm_spec *spec)
                         break; // No data, wait for next poll
                     }
                     if (n == -1) {
-                        ccm_log(CCM_LOG_ERROR, "read: child %d failed: %s\n",
+                        ccm_log(CCM_ERROR_LOG, "read: child %d failed: %s\n",
                                 cps[i].pid, strerror(errno));
                         break;
                     }
@@ -955,12 +1067,12 @@ void ccm_spec_build(ccm_spec *spec)
             }
 
             if (pfds[i].revents & (POLLERR | POLLNVAL)) {
-                ccm_log(CCM_LOG_ERROR, "poll error on fd %d: revents = %x\n", pfds[i].fd, pfds[i].revents);
+                ccm_log(CCM_ERROR_LOG, "poll error on fd %d: revents = %x\n", pfds[i].fd, pfds[i].revents);
             }
 
             if (ws[i] == 0) continue;
             if (ws[i] == -1) {
-                ccm_log(CCM_LOG_ERROR, "Target [%s]: waitpid failed on pid %d: %s\n",
+                ccm_log(CCM_ERROR_LOG, "Target [%s]: waitpid failed on pid %d: %s\n",
                         cps[i].target->name,
                         cps[i].pid,
                         strerror(errno));
@@ -969,17 +1081,17 @@ void ccm_spec_build(ccm_spec *spec)
             assert(close(pfds[i].fd) == 0); /* NOTE */
 
             if (WIFSIGNALED(cps[i].status)) {
-                ccm_log(CCM_LOG_ERROR,
+                ccm_log(CCM_ERROR_LOG,
                         "Target [%s] failed: child proc terminated with signal = %d\n",
                         cps[i].target->name,
                         WTERMSIG(cps[i].status));
             }
             if (WIFEXITED(cps[i].status)) {
-                ccm_log(CCM_LOG_INFO, "job [%d] time: %f ms\n", cps[i].id,
+                ccm_log(CCM_INFO_LOG, "job [%d] time: %f ms\n", cps[i].id,
                         1000 * (double)(clock() - cps[i].time)/CLOCKS_PER_SEC);
                 ccm_cmd_print(spec->arena, cps[i].cmd);
                 write(STDOUT_FILENO, cps[i].report.items, cps[i].report.len);
-                ccm_log(CCM_LOG_NONE,
+                ccm_log(CCM_NONE_LOG,
                         "============================================================"
                         "============================================================\n");
                 /* reset report buffers for future use */
@@ -998,7 +1110,7 @@ void ccm_spec_build(ccm_spec *spec)
             /* simulate removing child proc and associated
              * pollfd by swapping the last one
              */
-            ccm_swap(ccm_child_proc, cps[i], cps[n_running_jobs - 1]);
+            ccm_swap(ccm_childproc, cps[i], cps[n_running_jobs - 1]);
             ccm_swap(pollfd, pfds[i],pfds[n_running_jobs - 1]);
             --i;
             --n_running_jobs;
@@ -1020,7 +1132,7 @@ void ccm_spec_clean(ccm_spec *b)
 {
     for (s32 i = 1; i < b->deps.len; ++i) {
         if (remove(b->deps.items[i]->name) == -1) {
-            ccm_log(CCM_LOG_ERROR, "rm %s failed!\n", b->deps.items[i]->name);
+            ccm_log(CCM_ERROR_LOG, "rm %s failed!\n", b->deps.items[i]->name);
             continue;
         }
         b->deps.items[i]->visited = 0;
