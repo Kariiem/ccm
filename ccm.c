@@ -38,6 +38,12 @@ int main(s32 argc, c8 **argv)
         .sources = ccm_str8_array("./hello.c"),
     };
 
+    ccm_target hello2 = {
+        .name = "./hello2",
+        .sources = ccm_str8_array("./hello2.c"),
+    };
+
+
     ccm_target triangle = {
         .name = "./bin/triangle",
         .sources = ccm_str8_array("./examples/triangle.c"),
@@ -58,15 +64,16 @@ int main(s32 argc, c8 **argv)
     ccm_target z_buffer = {
         .name = "./bin/z-buffer",
         .sources = ccm_str8_array("./examples/z-buffer.c"),
-        /* .deps = ccm_deps_array(&geometry), */
+        .deps = ccm_deps_array(&geometry),
     };
 
-    /* triangle.deps = ccm_deps_array(&z_buffer, &geometry); */
-    /* obj2c.deps = ccm_deps_array(&z_buffer, &geometry); */
-    ccm_ignore(((void*[]){ &z_buffer, &geometry}));
+    hello2.deps = ccm_deps_array(&triangle, &hello);
+    triangle.deps = ccm_deps_array(&z_buffer, &geometry);
 
-    b.deps = ccm_deps_array(&hello, &obj2c, &triangle);
-
+    b.deps = ccm_deps_array(&hello, &hello2,
+                            &obj2c,
+                            &geometry, &z_buffer,
+                            &triangle);
 
     if (bb) bb(&b);
 

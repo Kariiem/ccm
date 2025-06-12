@@ -1004,15 +1004,17 @@ void ccm_proc_mgr_run(ccm_proc_mgr *pm)
          * This is why we do it after the ccm_spec_schedule
          */
         ccm_target *t = spec->deps.items[i];
-        if (t->deps.len == 0 && ccm_target_needs_rebuild(t)) {
-            ccm_rb_push(&ready_queue, t);
-        } else {
-            ++uptodate;
-            ccm_log(CCM_LOG_INFO,
-                    "Target [%s] upto data, skip rebuild\n",
-                    t->name);
-            ccm_sep(80);
-            ccm_target_propagate_done(t, &ready_queue);
+        if (t->deps.len == 0) {
+            if (ccm_target_needs_rebuild(t)) {
+                ccm_rb_push(&ready_queue, t);
+            } else {
+                ++uptodate;
+                ccm_log(CCM_LOG_INFO,
+                        "Target [%s] upto data, skip rebuild\n",
+                        t->name);
+                ccm_sep(80);
+                ccm_target_propagate_done(t, &ready_queue);
+            }
         }
     }
 
