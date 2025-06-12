@@ -13,7 +13,6 @@ void usage(c8 const* program)
 int main(s32 argc, c8 **argv)
 {
     ccm_bootstrap(argc, argv);
-
     ccm_spec b = {
         .compiler = "cc",
         .output_flag = "-o",
@@ -33,6 +32,11 @@ int main(s32 argc, c8 **argv)
         if (strcmp(argv[0], "build") == 0) bb = ccm_spec_build;
         else if (strcmp(argv[0], "clean") == 0) bb = ccm_spec_clean;
     }
+
+    ccm_target hello = {
+        .name = "./hello",
+        .sources = ccm_str8_array("./hello.c"),
+    };
 
     ccm_target triangle = {
         .name = "./bin/triangle",
@@ -61,7 +65,7 @@ int main(s32 argc, c8 **argv)
     /* obj2c.deps = ccm_deps_array(&z_buffer, &geometry); */
     ccm_ignore(((void*[]){ &z_buffer, &geometry}));
 
-    b.deps = ccm_deps_array(&obj2c, &triangle);
+    b.deps = ccm_deps_array(&hello, &obj2c, &triangle);
 
 
     if (bb) bb(&b);

@@ -75,8 +75,8 @@ typedef struct ccm_spec          ccm_spec;
 #    define ccm_unreachable()
 #endif
 #define ccm_assert(expr)     assert(expr)
-#define ccm_unused(v)        ((void)(v))
-#define ccm_ignore(v)        ccm_unused(v)
+#define ccm_unused(...)      ((void)((bool[]){__VA_ARGS__}))
+#define ccm_ignore(...)      ccm_unused(__VA_ARGS__)
 #define ccm_countof(a)       ((lll)(sizeof((a))/sizeof((a)[0])))
 #define ccm_lengthof(a)      (ccm_countof(a) - 1)
 #define ccm_container_of(ptr, type, member) /* https://en.wikipedia.org/wiki/Offsetof */ \
@@ -186,6 +186,8 @@ struct ccm_ring_buffer {
     ccm_rbvalue_t *items;
 };
 
+
+ccm_ring_buffer ccm_init_rb(ccm_arena *arena, lll cap);
 void          ccm_rb_push(ccm_ring_buffer *rb, ccm_rbvalue_t v);
 ccm_rbvalue_t ccm_rb_pop(ccm_ring_buffer *rb);
 ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb);
@@ -302,7 +304,6 @@ enum ccm_event {
     CCM_EVENT_POLLHUP      = 1 << 11,
     CCM_EVENT_POLLERR      = 1 << 12,
 
-    CCM_EVENT_CLOSE_ERR    = 1 << 20,
 };
 
 struct ccm_pipe {
@@ -392,7 +393,7 @@ bool ccm_target_needs_rebuild(ccm_target const *t);
 c8 **ccm_compile_cmd(ccm_spec *spec, ccm_target const *t);
 
 s32  ccm_spec_schedule_target(ccm_spec *spec, ccm_target *t, ccm_target_array *ta);
-void ccm_spec_schedule(ccm_spec *spec, ccm_target_array *ta);
+void ccm_spec_schedule(ccm_spec *spec);
 
 void ccm_spec_build_target(ccm_spec *spec, ccm_target const *t);
 void ccm_spec_build(ccm_spec *spec);
@@ -404,9 +405,6 @@ c8   *ccm_shift_args(s32 *argc, c8 ***argv);
 
 void  ccm_cmd_print(ccm_arena a, c8 **cmd);
 
-
-
-ccm_ring_buffer *ccm_compute_ready_queue(ccm_spec *spec);
 void ccm_compute_dependents(ccm_spec *spec);
 
 
@@ -430,34 +428,47 @@ s32 ccm_s32_min(s32 a, s32 b)
 // -----------------------------------------------------------------------------
 // Logger
 // -----------------------------------------------------------------------------
-void ccm_panic(c8 const *fmt, ...)
+void ccm_fputs(s32 l, c8 const *restrict s, FILE *restrict stream)
 {
-    fputs("[PANIC] :: ", stderr);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fputs("\n", stderr);
-    abort();
-}
-
-void ccm_log(s32 l, c8 const *fmt, ...)
-{
+    ccm_ignore(l, s, stream);
     c8 const *level = NULL;
-    va_list ap;
     switch(l) {
     case CCM_LOG_INFO:  level = "[INFO]";  break;
     case CCM_LOG_WARN:  level = "[WARN]";  break;
     case CCM_LOG_DEBUG: level = "[DEBUG]"; break;
     case CCM_LOG_ERROR: level = "[ERROR]"; break;
-    case CCM_LOG_NONE:  level = NULL; break;
+    case CCM_LOG_NONE:  level = "";         break;
     default: ccm_unreachable();
     }
+    fputs(level, stream);
+    fputs(s, stream);
+}
 
-    if (level) fprintf(stderr, "%s ", level);
+void ccm_panic(c8 const *fmt, ...)
+{
+    fputs("[PANIC] ", stdout);
+    va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vfprintf(stdout, fmt, ap);
     va_end(ap);
+    fputs("\n", stdout);
+    abort();
+}
+
+void ccm_log(s32 l, c8 const *fmt, ...)
+{
+    va_list ap;
+    ccm_fputs(l, " ", stdout);
+
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+}
+
+void ccm_sep(s32 len)
+{
+    for (;len;--len) ccm_fputs(CCM_LOG_NONE, "=", stdout);
+    ccm_fputs(CCM_LOG_NONE, "\n", stdout);
 }
 
 // -----------------------------------------------------------------------------
@@ -597,13 +608,17 @@ ccm_rbvalue_t ccm_rb_peek(ccm_ring_buffer const *rb)
 
 void ccm_rb_print(ccm_ring_buffer const *rb)
 {
-    ccm_log(CCM_LOG_DEBUG, "rb->cap = %d, rb->len = %d, rb->cap = %d, rb-> len = %d\n",
+    ccm_log(CCM_LOG_DEBUG, "rb->cap = %d, rb->len = %d, rb->read = %d, rb->write = %d\n",
             rb->cap, rb->len, rb->read, rb->write);
 
-    for (s32 i = 0; i < rb->len; ++i) {
-        ccm_log(CCM_LOG_DEBUG, "rb[%d] = %s, ", i, rb->items[i + rb->read]->name);
+    if (rb->len == 0) return;
+    ccm_log(CCM_LOG_DEBUG, "rb[0] = %s, ", rb->items[0 + rb->read]->name);
+    for (s32 i = 1; i < rb->len - 1; ++i) {
+        ccm_log(CCM_LOG_NONE, "rb[%d] = %s, ", i, rb->items[i + rb->read]->name);
     }
-    ccm_log(CCM_LOG_NONE, "\n");
+    ccm_log(CCM_LOG_NONE, "rb[%d] = %s\n",
+            rb->len - 1,
+            rb->items[rb->len - 1 + rb->read]->name);
 }
 
 // -----------------------------------------------------------------------------
@@ -672,6 +687,7 @@ void ccm_childproc_read(ccm_childproc *cp)
 void ccm_childproc_report(ccm_childproc *cp)
 {
     write(STDOUT_FILENO, cp->report.items, cp->report.len);
+    ccm_sep(80);
     /* reset the report buffer */
     memset(cp->report.items, 0, cp->report.len);
     cp->report.len = 0;
@@ -707,7 +723,16 @@ bool ccm_proc_mgr_add_target(ccm_proc_mgr *pm, ccm_target *t)
     return true;
 }
 
-
+void ccm_target_propagate_done(ccm_target const *t, ccm_ring_buffer *ready_queue)
+{
+    for (s32 i = 0; i < t->revdeps.len; ++i) {
+        ccm_target *rt = t->revdeps.items[i];
+        --rt->deps.len;
+        if (rt->deps.len == 0) {
+            ccm_rb_push(ready_queue, rt);
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Core
@@ -782,19 +807,29 @@ s32 ccm_spec_schedule_target(ccm_spec *spec, ccm_target *t, ccm_target_array *ta
     return t->level;
 }
 
-void ccm_spec_schedule(ccm_spec *spec, ccm_target_array *ta)
+void ccm_spec_schedule(ccm_spec *spec)
 {
+    ccm_target_array ta = {
+        .items = ccm_arena_alloc(ccm_target*, &spec->arena, spec->deps.len),
+        .len   = 0,
+    };
+
     for (s32 i = 0; i < spec->deps.len; ++i) {
-        ccm_spec_schedule_target(spec, spec->deps.items[i], ta);
+        ccm_spec_schedule_target(spec, spec->deps.items[i], &ta);
     }
+
+    spec->deps = ta;
+
     ccm_log(CCM_LOG_INFO, "job schedule: ");
-    for (s32 i = 0; i < ta->len - 1; ++i) {
+    for (s32 i = 0; i < ta.len - 1; ++i) {
         ccm_log(CCM_LOG_NONE, "{%s: %d} ~~~> ",
-                ta->items[i]->name, ta->items[i]->level);
+                ta.items[i]->name, ta.items[i]->level);
     }
     ccm_log(CCM_LOG_NONE, "{%s: %d}\n",
-            ta->items[ta->len - 1]->name,
-            ta->items[ta->len - 1]->level);
+            ta.items[ta.len - 1]->name,
+            ta.items[ta.len - 1]->level);
+
+    ccm_sep(80);
 }
 
 void ccm_cmd_print(ccm_arena scratch, c8 **cmd)
@@ -898,7 +933,9 @@ void ccm_proc_mgr_pub_ev(ccm_proc_mgr *pm)
 
         if (ret == -1) {
             if (errno == EINTR) evs[i] |= CCM_EVENT_WAIT_PENDING;
-            if (errno == ECHILD) ccm_panic("Invalid child process\n");
+            if (errno == ECHILD) {
+                ccm_panic("Target [%s]: invalid child process\n", cps[i].target->name);
+            }
             evs[i] |= CCM_EVENT_WAIT_ERROR;
             continue;
         }
@@ -923,29 +960,86 @@ void ccm_proc_mgr_run(ccm_proc_mgr *pm)
     pollfd        *pfds = pm->pfds;
     ccm_event     *evs  = pm->evs;
 
-    ccm_ring_buffer *ready_queue = ccm_compute_ready_queue(pm->spec);
+    s32 uptodate = 0;
 
-    s32 remaining_targets = pm->spec->deps.len;
-    s32 read_mask = (CCM_EVENT_POLLIN | CCM_EVENT_POLLHUP);
-    s32 done_mask = (CCM_EVENT_WAIT_DONE | CCM_EVENT_WAIT_ERROR |
-                     CCM_EVENT_WAIT_TERM | CCM_EVENT_CLOSE_ERR);
+    ccm_ring_buffer ready_queue = ccm_init_rb(&spec->arena, spec->deps.len);
 
+    /* useful for cycle detection and removing duplicates */
+    ccm_spec_schedule(spec);
 
-
+    /* compute dependent arrays before any call to ccm_target_propagate_done */
     ccm_compute_dependents(pm->spec);
 
+    for (s32 i = 0; i < spec->deps.len; ++i) {
+        /* NOTE
+         * Caching is done here, assume we have tree of targets, something like
+         * t4
+         *    t3
+         *       t1
+         *    t2
+         *       t0
+         * the leaves, here t1 and t0 control whether we would trigger a full rebuild or
+         * not,
+         * if yes:
+         *     then the leaves are pushed to the ready queue, and later
+         *     propagation of completed targets are not checked for rebuild,
+         * else:
+         *     t0 and t1 are skipped, but they cause t2 and t3 to become leaves,
+         *     their deps.len is now zero after propagating they are done. So now
+         *     we have t3 and t2 to do the same check of whether if they need rebuild
+         *     or not.
+         *
+         * Note that we don't check in the event loop whether a target requires rebuild
+         * or not, since a target added to the ready queue in the event loop is a target
+         * that had a dependency rebuilt, so the target is automatically rebuilt.
+         *
+         * This might seem a recursive problem: how do we check leaves and after we
+         * propagate their no-need to rebuild, how do we check the new leaves, and after
+         * we propagate their no-need to rebuild, .....
+         *
+         * The solution is to use topological sorting, so leaves are check in the order
+         * of dependencies come first, hence propagating and checking is done in the
+         * linear scan of the topologically sorted targets.
+         *
+         * This is why we do it after the ccm_spec_schedule
+         */
+        ccm_target *t = spec->deps.items[i];
+        if (t->deps.len == 0 && ccm_target_needs_rebuild(t)) {
+            ccm_rb_push(&ready_queue, t);
+        } else {
+            ++uptodate;
+            ccm_log(CCM_LOG_INFO,
+                    "Target [%s] upto data, skip rebuild\n",
+                    t->name);
+            ccm_sep(80);
+            ccm_target_propagate_done(t, &ready_queue);
+        }
+    }
+
+
+    s32 remaining_targets = spec->deps.len - uptodate;
+    s32 read_mask = (CCM_EVENT_WAIT_DONE | CCM_EVENT_POLLIN | CCM_EVENT_POLLHUP);
+    s32 done_mask = (CCM_EVENT_WAIT_DONE | CCM_EVENT_WAIT_ERROR | CCM_EVENT_WAIT_TERM);
+
+
     while (remaining_targets > 0) {
+#ifdef CCM_INTERNAL_DEBUG
+        ccm_rb_print(&ready_queue);
+#endif
 
-        for (ccm_target *t = ccm_rb_peek(ready_queue);
-             ready_queue->len > 0 && ccm_proc_mgr_add_target(pm, t);
-             ccm_rb_pop(ready_queue), t = ccm_rb_peek(ready_queue));
+        for (ccm_target *t = ccm_rb_peek(&ready_queue);
+             ready_queue.len > 0 && ccm_proc_mgr_add_target(pm, t);
+             ccm_rb_pop(&ready_queue), t = ccm_rb_peek(&ready_queue));
 
+#ifdef CCM_INTERNAL_DEBUG
+        ccm_log(CCM_LOG_DEBUG, "proc_mgr: nrunning = %d\n", pm->nrunning);
+#endif
         /* reset events */
         for (s32 i = 0; i < pm->nrunning; ++i) evs[i] = 0;
 
-        if (pm->nrunning > 0) ccm_proc_mgr_pub_ev(pm);
-        for (s32 i = 0; i < pm->nrunning; ++i) {
+        ccm_proc_mgr_pub_ev(pm);
 
+        for (s32 i = 0; i < pm->nrunning; ++i) {
             if (evs[i] & read_mask) {
                 ccm_childproc_read(&cps[i]);
                 if (evs[i] & POLLHUP) {
@@ -958,16 +1052,13 @@ void ccm_proc_mgr_run(ccm_proc_mgr *pm)
 
             if (evs[i] & done_mask) {
                 /* update the ready queue with targets in current target depedent list */
-                for (s32 d = 0; d < cps[i].target->revdeps.len; ++d) {
-                    ccm_target *rt = cps[i].target->revdeps.items[d];
-                    --rt->deps.len;
-                    if (rt->deps.len == 0) {
-                        ccm_rb_push(ready_queue, rt);
-                    }
-                }
+                ccm_target_propagate_done(cps[i].target, &ready_queue);
+                double cptime = 1000 * (double)(clock() - cps[i].time)/CLOCKS_PER_SEC;
                 if (evs[i] & CCM_EVENT_WAIT_DONE) {
-                    ccm_log(CCM_LOG_INFO, "job [%d] time: %f ms\n", cps[i].pid,
-                            1000 * (double)(clock() - cps[i].time)/CLOCKS_PER_SEC);
+                    ccm_log(CCM_LOG_INFO, "Target [%s], job [%d] time: %f ms\n",
+                            cps[i].target->name,
+                            cps[i].pid,
+                            cptime);
                     ccm_as_scratch_arena(spec->arena) {
                         ccm_log(CCM_LOG_INFO, "CMD: %s\n",
                                 ccm_concat(&spec->arena, cps[i].cmd));
@@ -977,9 +1068,9 @@ void ccm_proc_mgr_run(ccm_proc_mgr *pm)
                 ccm_swap(ccm_childproc, cps[i], cps[pm->nrunning - 1]);
                 ccm_swap(pollfd, pfds[i], pfds[pm->nrunning - 1]);
                 ccm_swap(ccm_event, evs[i], evs[pm->nrunning - 1]);
-                --i;
                 --pm->nrunning;
                 --remaining_targets;
+                --i;
             }
             /* TODO: handle error events with proper error messages */
         }
@@ -1032,7 +1123,12 @@ void ccm_bootstrap(s32 argc, c8 **argv)
         .sources = ccm_str8_array("ccm.c"),
         .watch   = ccm_str8_array("ccm.h"),
     };
-    if (!ccm_target_needs_rebuild(&bootstrap)) return;
+    if (!ccm_target_needs_rebuild(&bootstrap)) {
+        ccm_log(CCM_LOG_INFO,
+                "Target [%s] upto data, skip rebuild\n",
+                bootstrap.name);
+        return;
+    }
 
     ccm_spec spec = {
         .compiler = "cc",
@@ -1054,6 +1150,7 @@ void ccm_bootstrap(s32 argc, c8 **argv)
     {
         ccm_proc_mgr_run(&pm);
         if (WEXITSTATUS(pm.cps[0].status) == EXIT_FAILURE) {
+            ccm_log(CCM_LOG_INFO, "bootstrap failed\n");
             rename(tmpname, bootstrap.name);
             exit(EXIT_FAILURE);
         }
@@ -1092,19 +1189,15 @@ void ccm_compute_dependents(ccm_spec *spec)
     }
 }
 
-ccm_ring_buffer *ccm_compute_ready_queue(ccm_spec *spec)
+ccm_ring_buffer ccm_init_rb(ccm_arena *arena, lll cap)
 {
-    ccm_ring_buffer *ready_queue = ccm_arena_alloc(ccm_ring_buffer, &spec->arena);
-    ready_queue->items = ccm_arena_alloc(ccm_rbvalue_t, &spec->arena, spec->deps.len);
-    ready_queue->cap = spec->deps.len;
-    ready_queue->len = 0;
-    ready_queue->read = 0;
-    ready_queue->write = 0;
-
-    for (s32 i = 0; i < spec->deps.len; ++i) {
-        ccm_target *t = spec->deps.items[i];
-        if (t->deps.len == 0) ccm_rb_push(ready_queue, t);
-    }
+    ccm_ring_buffer ready_queue = {
+        .cap = cap,
+        .len = 0,
+        .read = 0,
+        .write = 0,
+        .items = ccm_arena_alloc(ccm_rbvalue_t, arena, cap),
+    };
     return ready_queue;
 }
 
@@ -1114,13 +1207,6 @@ ccm_ring_buffer *ccm_compute_ready_queue(ccm_spec *spec)
 
 void ccm_spec_build(ccm_spec *spec)
 {
-    ccm_as_scratch_arena(spec->arena) {
-        /* useful for cycle detection */
-        ccm_target_array dfs = {0};
-        dfs.items = ccm_arena_alloc(ccm_target*, &spec->arena, spec->deps.len);
-        ccm_spec_schedule(spec, &dfs);
-    }
-
     ccm_proc_mgr pm = ccm_proc_mgr_init(spec, CCM_DEFAULT_TIMEOUT);
     {
         /* this is where the ready-queue is populated and consumed */
