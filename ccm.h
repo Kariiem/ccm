@@ -303,7 +303,6 @@ enum ccm_event {
     CCM_EVENT_POLLERR      = 1 << 12,
 
     CCM_EVENT_CLOSE_ERR    = 1 << 20,
-
 };
 
 struct ccm_pipe {
@@ -367,8 +366,10 @@ struct ccm_target_array {
 struct ccm_target {
     c8 *name;
     ccm_str8_array sources;
-    ccm_str8_array compiler_opts;
-    ccm_str8_array linker_opts;
+    ccm_str8_array watch;
+    ccm_str8_array pre_opts;
+    ccm_str8_array post_opts;
+
     ccm_target_array deps;
     ccm_target_array revdeps;
 
@@ -750,6 +751,14 @@ bool ccm_target_needs_rebuild(ccm_target const *t)
             return true;
         }
     }
+
+    for (s32 i = 0; i < t->watch.len; ++i) {
+        if (stat(t->watch.items[i], &srcfile_stat) != -1 &&
+            output_mtime < srcfile_stat.st_mtime) {
+            return true;
+        }
+    }
+
     return false;
 }
 
@@ -816,11 +825,11 @@ c8 **ccm_compile_cmd(ccm_spec *spec, ccm_target const *t)
 {
     lll cmd_len = 1             /* compiler */
         + spec->common_opts.len
-        + t->compiler_opts.len
+        + t->pre_opts.len
         + 1                     /* -o */
         + 1                     /* name */
         + t->sources.len
-        + t->linker_opts.len
+        + t->post_opts.len
         + 1;                    /* NULL terminator */
 
     c8 **cmd  = ccm_arena_alloc(c8*, &spec->arena, cmd_len);
@@ -831,8 +840,8 @@ c8 **ccm_compile_cmd(ccm_spec *spec, ccm_target const *t)
         cmd[cmd_len++] = spec->common_opts.items[i];
     }
 
-    for (s32 i = 0; i < t->compiler_opts.len; ++i) {
-        cmd[cmd_len++] = t->compiler_opts.items[i];
+    for (s32 i = 0; i < t->pre_opts.len; ++i) {
+        cmd[cmd_len++] = t->pre_opts.items[i];
     }
 
     cmd[cmd_len++] = spec->output_flag;
@@ -842,8 +851,8 @@ c8 **ccm_compile_cmd(ccm_spec *spec, ccm_target const *t)
         cmd[cmd_len++] = t->sources.items[i];
     }
 
-    for (s32 i = 0; i < t->linker_opts.len; ++i) {
-        cmd[cmd_len++] = t->linker_opts.items[i];
+    for (s32 i = 0; i < t->post_opts.len; ++i) {
+        cmd[cmd_len++] = t->post_opts.items[i];
     }
     cmd[cmd_len++] = NULL;
 
@@ -914,28 +923,27 @@ void ccm_proc_mgr_run(ccm_proc_mgr *pm)
     pollfd        *pfds = pm->pfds;
     ccm_event     *evs  = pm->evs;
 
+    ccm_ring_buffer *ready_queue = ccm_compute_ready_queue(pm->spec);
 
     s32 remaining_targets = pm->spec->deps.len;
-
     s32 read_mask = (CCM_EVENT_POLLIN | CCM_EVENT_POLLHUP);
     s32 done_mask = (CCM_EVENT_WAIT_DONE | CCM_EVENT_WAIT_ERROR |
                      CCM_EVENT_WAIT_TERM | CCM_EVENT_CLOSE_ERR);
 
-    ccm_ring_buffer *ready_queue = ccm_compute_ready_queue(pm->spec);
+
+
     ccm_compute_dependents(pm->spec);
 
     while (remaining_targets > 0) {
 
         for (ccm_target *t = ccm_rb_peek(ready_queue);
-             ready_queue->len > 0 && (ccm_target_needs_rebuild(t) ? ccm_proc_mgr_add_target(pm, t) : true);
-             ccm_rb_pop(ready_queue), t = ccm_rb_peek(ready_queue)) {
-
-        }
+             ready_queue->len > 0 && ccm_proc_mgr_add_target(pm, t);
+             ccm_rb_pop(ready_queue), t = ccm_rb_peek(ready_queue));
 
         /* reset events */
         for (s32 i = 0; i < pm->nrunning; ++i) evs[i] = 0;
 
-        ccm_proc_mgr_pub_ev(pm);
+        if (pm->nrunning > 0) ccm_proc_mgr_pub_ev(pm);
         for (s32 i = 0; i < pm->nrunning; ++i) {
 
             if (evs[i] & read_mask) {
@@ -1021,12 +1029,10 @@ void ccm_bootstrap(s32 argc, c8 **argv)
     ccm_unused(argc);
     ccm_target bootstrap = {
         .name = "./ccm",
-        .sources = ccm_str8_array("ccm.c", "ccm.h"),
+        .sources = ccm_str8_array("ccm.c"),
+        .watch   = ccm_str8_array("ccm.h"),
     };
-    if (!ccm_target_needs_rebuild(&bootstrap)) {
-        ccm_log(CCM_LOG_INFO, "ccm upto date, skip bootstrapping\n");
-        return;
-    }
+    if (!ccm_target_needs_rebuild(&bootstrap)) return;
 
     ccm_spec spec = {
         .compiler = "cc",
@@ -1036,15 +1042,19 @@ void ccm_bootstrap(s32 argc, c8 **argv)
         .deps = ccm_deps_array(&bootstrap),
         .j = 2,
     };
+    /* NOTE
+     * the following check is needed outside compute_ready_queue/proc_mgr_run
+     * due to the renaming of the executable to avoid overwriting it.
+     */
 
-    c8 *oldname = ccm_fmt(&spec.arena, "%s.old", bootstrap.name);
-    rename(bootstrap.name, oldname);
+    c8 *tmpname = ccm_fmt(&spec.arena, "%s.old", bootstrap.name);
+    rename(bootstrap.name, tmpname);
 
     ccm_proc_mgr pm = ccm_proc_mgr_init(&spec, CCM_BOOTSTRAP_TIMEOUT);
     {
         ccm_proc_mgr_run(&pm);
         if (WEXITSTATUS(pm.cps[0].status) == EXIT_FAILURE) {
-            rename(oldname, bootstrap.name);
+            rename(tmpname, bootstrap.name);
             exit(EXIT_FAILURE);
         }
     }
@@ -1093,9 +1103,7 @@ ccm_ring_buffer *ccm_compute_ready_queue(ccm_spec *spec)
 
     for (s32 i = 0; i < spec->deps.len; ++i) {
         ccm_target *t = spec->deps.items[i];
-        if (t->deps.len == 0) {
-            ccm_rb_push(ready_queue, t);
-        }
+        if (t->deps.len == 0) ccm_rb_push(ready_queue, t);
     }
     return ready_queue;
 }

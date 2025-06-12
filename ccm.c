@@ -37,7 +37,7 @@ int main(s32 argc, c8 **argv)
     ccm_target triangle = {
         .name = "./bin/triangle",
         .sources = ccm_str8_array("./examples/triangle.c"),
-        .linker_opts = ccm_str8_array("-lraylib", "-lm"),
+        .post_opts = ccm_str8_array("-lraylib", "-lm"),
     };
 
     ccm_target obj2c = {
@@ -48,7 +48,7 @@ int main(s32 argc, c8 **argv)
     ccm_target geometry = {
         .name = "./lib/geom",
         .sources = ccm_str8_array("./lib/geometry.c"),
-        .compiler_opts = ccm_str8_array("-c"),
+        .pre_opts = ccm_str8_array("-c"),
     };
 
     ccm_target z_buffer = {
