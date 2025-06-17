@@ -742,7 +742,8 @@ void ccm_target_propagate_done(ccm_target const *t, ccm_ring_buffer *ready_queue
 #define fork()          (++fork_count, vfork())
 #define exec(...)       (++exec_count, exec(__VA_ARGS__))
 #define stat(path, buf) (++stat_count,                                  \
-                         ccm_log(CCM_LOG_INFO, "stat(%s)\n", path),     \
+                         ccm_log(CCM_LOG_INFO, "%s: %d, stat(%s)\n",    \
+                                 __FILE_NAME__, __LINE__, path),        \
                          stat(path, buf))
 
 static s32 fork_count = 0;
@@ -1010,7 +1011,7 @@ void ccm_proc_mgr_run(ccm_proc_mgr *pm)
             } else {
                 ++uptodate;
                 ccm_log(CCM_LOG_INFO,
-                        "Target [%s] upto data, skip rebuild\n",
+                        "Target [%s] upto date, skip rebuild\n",
                         t->name);
                 ccm_sep(80);
                 ccm_target_propagate_done(t, &ready_queue);
@@ -1127,7 +1128,7 @@ void ccm_bootstrap(s32 argc, c8 **argv)
     };
     if (!ccm_target_needs_rebuild(&bootstrap)) {
         ccm_log(CCM_LOG_INFO,
-                "Target [%s] upto data, skip rebuild\n",
+                "Target [%s] upto date, skip rebuild\n",
                 bootstrap.name);
         return;
     }
