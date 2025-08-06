@@ -1,5 +1,5 @@
 #define CCM_IMPLEMENTATION
-#include "ccm.h"
+#include "../ccm.h"
 
 #define ignore(v) ((void)(v))
 typedef void (*build_callable)(ccm_spec *);
